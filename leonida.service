@@ -1,0 +1,30 @@
+[Unit]
+Description=Leonida RC car
+# The Pi is useless here until it has an address to serve on.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three to match your account if you are not the default user.
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Leonida
+ExecStart=/usr/bin/python3 /home/pi/Leonida/leonida.py
+
+# Come back from a crash, but do not fight a machine that cannot start at all.
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# SIGTERM is handled: the motors are stopped before the process exits. Give it
+# room to do that rather than killing it mid-shutdown with the car still moving.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# So journalctl shows motor lines as they happen instead of in batches.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
