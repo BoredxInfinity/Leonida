@@ -440,6 +440,92 @@ def _kill(proc):
 # Markers that stand alone: no length field, nothing to skip over.
 _STANDALONE = {0x01, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7}
 
+# The Huffman tables from the JPEG specification, Annex K.
+#
+# Most USB webcams emit "MJPEG" frames with no Huffman table in them at all --
+# the AVI1 convention, where every frame is understood to use these standard
+# tables and leaves them out to save a couple of hundred bytes per frame. A
+# decoder that expects a whole JPEG file has nothing to decode with. ffmpeg
+# copes, which is why the stream looks healthy from the Pi's side; browsers do
+# not. Safari refuses the image outright and shows a broken-image icon, and
+# Chrome renders convincing garbage, which is arguably worse.
+#
+# So when a frame arrives without tables we put these back. Written out rather
+# than copied from a sample file on purpose: ffmpeg's encoder emits *optimised*
+# tables tuned to one image, and those are precisely the wrong thing to hand a
+# frame that was encoded against the standard ones.
+_DC_LUMA_BITS = (0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+_DC_CHROMA_BITS = (0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0)
+_DC_VALUES = tuple(range(12))
+
+_AC_LUMA_BITS = (0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D)
+_AC_LUMA_VALUES = (
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
+    0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+    0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16,
+    0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+    0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+    0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+    0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+    0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+    0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4,
+    0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+    0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA,
+    0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA,
+)
+
+_AC_CHROMA_BITS = (0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77)
+_AC_CHROMA_VALUES = (
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
+    0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
+    0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
+    0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34,
+    0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
+    0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+    0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96,
+    0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
+    0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4,
+    0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
+    0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2,
+    0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
+    0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9,
+    0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA,
+)
+
+
+def _dht_segment():
+    """The four standard tables as one DHT segment, ready to splice in."""
+    body = b""
+    for slot, bits, values in (
+            (0x00, _DC_LUMA_BITS, _DC_VALUES),        # DC, table 0: luminance
+            (0x10, _AC_LUMA_BITS, _AC_LUMA_VALUES),   # AC, table 0
+            (0x01, _DC_CHROMA_BITS, _DC_VALUES),      # DC, table 1: chrominance
+            (0x11, _AC_CHROMA_BITS, _AC_CHROMA_VALUES),   # AC, table 1
+    ):
+        assert sum(bits) == len(values), "Huffman table is inconsistent"
+        body += bytes((slot,)) + bytes(bits) + bytes(values)
+    return b"\xff\xc4" + struct.pack(">H", len(body) + 2) + body
+
+
+STD_DHT = _dht_segment()
+_said_no_tables = False
+
 
 def jpeg_frames():
     """Cuts ffmpeg's MJPEG output into whole JPEG images.
@@ -464,9 +550,12 @@ def jpeg_frames():
     pos = 0                    # how far into buf we have parsed
     synced = False
     scan = False               # inside entropy-coded data after SOS
+    has_dht = False            # did this frame bring its own Huffman tables?
+    sos_at = -1                # where to splice them in if it did not
 
     def feed(chunk):
-        nonlocal pos, synced, scan
+        nonlocal pos, synced, scan, has_dht, sos_at
+        global _said_no_tables
         buf.extend(chunk)
         out = []
 
@@ -479,6 +568,7 @@ def jpeg_frames():
                     break
                 del buf[:i]                        # drop anything before it
                 synced, scan, pos = True, False, 2
+                has_dht, sos_at = False, -1
 
             n = len(buf)
             end = -1                               # index just past this EOI
@@ -524,6 +614,10 @@ def jpeg_frames():
                     synced = False
                     del buf[:2]
                     break
+                if marker == 0xC4:                 # this frame has its own
+                    has_dht = True
+                elif marker == 0xDA:               # tables must precede the scan
+                    sos_at = pos
                 pos += 2 + length
                 if marker == 0xDA:                 # start of scan
                     scan = True
@@ -536,9 +630,21 @@ def jpeg_frames():
                     synced, scan, pos = False, False, 0
                 break                              # wait for more bytes
 
-            out.append(bytes(buf[:end]))
+            if has_dht or sos_at < 0:
+                out.append(bytes(buf[:end]))
+            else:
+                # A tableless webcam frame. Give it the standard tables it was
+                # encoded against, so what leaves here is a whole JPEG file
+                # rather than one that only ffmpeg is forgiving enough to read.
+                out.append(bytes(buf[:sos_at]) + STD_DHT +
+                           bytes(buf[sos_at:end]))
+                if not _said_no_tables:
+                    _said_no_tables = True
+                    print("  [video] camera sends frames without Huffman "
+                          "tables -- adding the standard ones")
             del buf[:end]
             synced, scan, pos = False, False, 0
+            has_dht, sos_at = False, -1
 
         return out
 
@@ -630,6 +736,76 @@ def detect_audio_device():
         return "default"
     m = re.search(r"^card (\d+):.*?device (\d+):", out, re.M)
     return f"plughw:{m.group(1)},{m.group(2)}" if m else "default"
+
+
+def describe_jpeg(frame):
+    """What a decoder will make of this frame: its segments and its size."""
+    names = {0xC0: "SOF0 baseline", 0xC1: "SOF1", 0xC2: "SOF2 progressive",
+             0xC4: "DHT huffman", 0xDB: "DQT quant", 0xDD: "DRI restart",
+             0xDA: "SOS scan", 0xE0: "APP0/JFIF", 0xE1: "APP1/EXIF",
+             0xFE: "COM"}
+    found, size, i = [], None, 2
+    while i + 1 < len(frame) and frame[i] == 0xFF:
+        marker = frame[i + 1]
+        found.append(names.get(marker, hex(marker)))
+        if marker == 0xDA:
+            break
+        length = (frame[i + 2] << 8) | frame[i + 3]
+        if marker in (0xC0, 0xC1, 0xC2):
+            size = ((frame[i + 7] << 8) | frame[i + 8],
+                    (frame[i + 5] << 8) | frame[i + 6])
+        i += 2 + length
+    return found, size
+
+
+def check_camera():
+    """Grab one frame and say whether it is something a browser can show.
+
+    The camera can look perfectly healthy from the Pi -- ffmpeg is forgiving
+    about frames a browser will not touch -- so this reports what is actually
+    in a frame rather than merely whether one arrived.
+    """
+    stream = Stream("video", video_argv, jpeg_frames, mjpeg_wrapper,
+                    VIDEO_QUEUE, "image/jpeg")
+    print(f"\n  opening {CFG.video_device} via {CFG.video_format} ...")
+    att, sub, error = stream.subscribe()
+    if error is not None:
+        print(f"  FAILED: {json.loads(error[1])['error']}\n")
+        return 1
+    try:
+        frame = None
+        deadline = time.monotonic() + START_WAIT
+        while frame is None and time.monotonic() < deadline:
+            frame = sub.get(1.0)
+            if sub.ended:
+                break
+    finally:
+        stream.unsubscribe(att, sub)
+
+    if frame is None:
+        print("  FAILED: the camera opened but sent no frame\n")
+        return 1
+
+    found, size = describe_jpeg(frame)
+    path = "/tmp/leonida-frame.jpg"
+    with open(path, "wb") as f:
+        f.write(frame)
+
+    print(f"  got a frame: {len(frame)} bytes"
+          f"{', %dx%d' % size if size else ''}")
+    print(f"  segments:    {', '.join(found)}")
+    print(f"  saved to     {path}")
+    if _said_no_tables:
+        print("\n  This camera sends frames with no Huffman tables, which is\n"
+              "  normal for USB webcams. The standard ones are being added,\n"
+              "  so what reaches the browser is a complete JPEG.")
+    if any(s.startswith("SOF2") for s in found):
+        print("\n  WARNING: progressive JPEG. Some browsers will not show this\n"
+              "  as a live feed. Try a different --width/--height.")
+    print("\n  Open that file, or copy it off the Pi and open it. If it looks\n"
+          "  right, the camera and the framing are fine and the problem is\n"
+          "  in the browser; if it looks wrong, it is the capture.\n")
+    return 0
 
 
 def list_devices():
@@ -1220,6 +1396,7 @@ PAGE = r"""<!doctype html>
   // and works in anything that can show a picture.
   const feed = $('feed'), feedmsg = $('feedmsg'), feedtext = $('feedtext');
   let camWs = null, camTimer = null, camTries = 0, camPolling = false;
+  let camBadFrames = 0;
   const camUrls = [];
 
   function say(text, spinning){
@@ -1247,12 +1424,31 @@ PAGE = r"""<!doctype html>
     // from under Safari mid-decode blanks the picture.
     camUrls.push(url);
     while (camUrls.length > 3) URL.revokeObjectURL(camUrls.shift());
-    camLive();
+  }
+
+  // An <img> that cannot decode what it was given shows a broken-image icon
+  // and says nothing about why, which is a miserable thing to debug from the
+  // driving seat. If frames are plainly arriving and none of them decode, say
+  // exactly that instead of leaving a question mark sitting there.
+  function camWatchDecode(){
+    feed.onload = () => {
+      if (camPolling) return;
+      camBadFrames = 0;
+      camLive();
+    };
+    feed.onerror = () => {
+      if (camPolling) return;
+      if (++camBadFrames === 8){
+        say('frames are arriving, but this browser cannot decode them ' +
+            '— see "camera" in the README', false);
+      }
+    };
   }
 
   function camStop(){
     clearTimeout(camTimer); camTimer = null;
     camPolling = false;
+    camBadFrames = 0;
     feed.onload = feed.onerror = null;
     if (camWs){ const s = camWs; camWs = null; try { s.close(); } catch {} }
     feed.removeAttribute('src');
@@ -1280,6 +1476,7 @@ PAGE = r"""<!doctype html>
     } catch { camPollStart(); return; }
     sock.binaryType = 'arraybuffer';
     camWs = sock;
+    camWatchDecode();
 
     sock.onmessage = ev => {
       if (typeof ev.data === 'string'){        // the car explaining itself
@@ -1799,11 +1996,16 @@ def main():
                     help="ffmpeg input format (avfoundation on a Mac)")
     ap.add_argument("--list-devices", action="store_true",
                     help="show the cameras and mics this machine can see, then exit")
+    ap.add_argument("--check-camera", action="store_true",
+                    help="grab one frame, report what is in it, then exit")
     CFG = ap.parse_args()
 
     if CFG.list_devices:
         list_devices()
         return
+
+    if CFG.check_camera:
+        sys.exit(check_camera())
 
     if CFG.audio_device == "auto":
         CFG.audio_device = detect_audio_device()

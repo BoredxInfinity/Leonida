@@ -48,6 +48,7 @@ It prints the URL to open. Useful flags:
 
 ```bash
 python3 leonida.py --list-devices          # what cameras and mics can it see?
+python3 leonida.py --check-camera          # grab one frame and inspect it
 python3 leonida.py --width 1280 --height 720 --fps 15
 python3 leonida.py --video-device /dev/video2
 python3 leonida.py --audio-device plughw:2,0
@@ -185,6 +186,28 @@ reachable and look at `journalctl -u leonida -f` for control socket lines.
 **The feed says "snapshot mode".** The page could not open a video WebSocket and
 has fallen back to polling JPEGs. It works, but something is blocking WebSockets
 — usually a proxy between the phone and the Pi. Connect to the Pi directly.
+
+**A broken-image icon where the picture should be** (a blue question mark in
+Safari), or the page saying frames arrive but cannot be decoded. The transport
+is fine and the frames themselves are the problem. Run:
+
+```bash
+python3 leonida.py --check-camera
+```
+
+It grabs one frame, lists what is inside it, and saves it to
+`/tmp/leonida-frame.jpg`. Open that file: if it looks right, the capture is fine
+and the trouble is in the browser; if it looks wrong, it is the camera.
+
+Two things it checks for specifically:
+
+- **No Huffman tables.** Most USB webcams leave them out of every frame — the
+  AVI1 convention, where the standard tables are assumed. ffmpeg reads such
+  frames happily, which is why everything looks healthy on the Pi, but a strict
+  decoder is entitled to refuse them. The standard tables are put back
+  automatically, and `--check-camera` says so when it happens.
+- **Progressive JPEG.** Rare from a webcam, and not reliably displayable as a
+  live feed. Try a different `--width`/`--height`.
 
 **Motors twitch but do not turn.** Raise **min speed** in settings.
 
