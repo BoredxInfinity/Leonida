@@ -61,6 +61,7 @@ DEADMAN = 0.6              # seconds of silence before the motors cut out
 WATCHDOG_TICK = 0.1
 
 START_WAIT = 20.0          # how long a viewer waits for a capture to come up
+LINGER = 3.0               # keep a capture warm this long after the last viewer
 VIDEO_QUEUE = 4            # frames held per browser before it starts skipping
 AUDIO_QUEUE = 48           # chunks held per browser
 MAX_FRAME_BUFFER = 4 * 1024 * 1024
@@ -71,6 +72,12 @@ WS_MAX_PAYLOAD = 64 * 1024
 WS_PING = 5.0              # silence before the server pings the browser
 WS_QUIET = 4               # unanswered pings before we hang up (~20s)
 WS_PATIENCE = 10.0         # limit on how long one frame may take to arrive
+
+# socket.timeout only became an alias of the builtin TimeoutError in Python
+# 3.10, and Pi OS ships 3.9 on Bullseye and 3.11 on Bookworm. Catching just one
+# of them is the difference between a control socket that idles quietly and one
+# that hangs up every five seconds on half the Raspberry Pis in the world.
+TIMED_OUT = (TimeoutError, socket.timeout)
 
 CFG = None                 # argparse namespace, filled in by main()
 
@@ -348,13 +355,25 @@ class Stream:
             print(f"  [{self.name}] capture up")
 
             split = self.split()
+            empty_since = None
             while chunk:
                 for item in split(chunk):
                     self._broadcast(att, item)
+
+                # Hang on briefly after the last viewer leaves rather than
+                # tearing the camera down the instant nobody is subscribed.
+                # A browser reconnecting, or the snapshot fallback polling one
+                # frame at a time, would otherwise restart ffmpeg constantly --
+                # and a webcam takes far longer to open than it does to serve.
                 with self.lock:
-                    if not att.subs:              # last viewer left
+                    if att.subs:
+                        empty_since = None
+                    elif empty_since is None:
+                        empty_since = time.monotonic()
+                    elif time.monotonic() - empty_since > LINGER:
                         self.thread = None
                         return
+
                 # read1 hands over whatever has arrived rather than waiting to
                 # fill a buffer -- that is what keeps the feed live.
                 chunk = proc.stdout.read1(65536)
@@ -1185,18 +1204,34 @@ PAGE = r"""<!doctype html>
   drawKnob();
 
   // ---- camera feed -------------------------------------------------------
-  // Safari will not render a multipart/x-mixed-replace stream in an <img> --
-  // it just fires error -- so pointing img.src at the feed shows nothing on an
-  // iPhone. We read the multipart body ourselves instead and hand the <img>
-  // one finished frame at a time as a blob, which every browser can decode.
-  // Aborting the fetch ends the request, which is what frees the camera.
+  // Frames arrive over a WebSocket, one whole JPEG per binary message, and go
+  // into the <img> as blob URLs.
+  //
+  // Both of the obvious ways to show a live camera fail on Safari, which means
+  // they fail on every iPhone -- the exact machine this page is meant for.
+  // An <img> pointed at a multipart/x-mixed-replace stream is not rendered at
+  // all; reading that same stream with fetch() needs streaming response bodies,
+  // which Safari did not have until 14.1 and still treats specially for
+  // multipart. A binary WebSocket has worked since Safari 6 and iOS 6, needs no
+  // parsing here, and pushes frames rather than waiting to be asked.
+  //
+  // If a WebSocket cannot be had at all, we fall back to reloading a plain
+  // JPEG from /snapshot.jpg, which is just an <img> loading an ordinary image
+  // and works in anything that can show a picture.
   const feed = $('feed'), feedmsg = $('feedmsg'), feedtext = $('feedtext');
-  let camTimer = null, camTries = 0, camAbort = null, camUrl = null;
+  let camWs = null, camTimer = null, camTries = 0, camPolling = false;
+  const camUrls = [];
 
   function say(text, spinning){
     feedtext.textContent = text;
     feedmsg.querySelector('.spin').style.visibility = spinning ? '' : 'hidden';
     feedmsg.classList.add('show');
+  }
+
+  function camLive(){
+    if (feed.classList.contains('dead')){      // first frame through
+      camTries = 0; feed.classList.remove('dead'); feedmsg.classList.remove('show');
+    }
   }
 
   // Handed straight to the <img>, not queued behind requestAnimationFrame:
@@ -1207,83 +1242,85 @@ PAGE = r"""<!doctype html>
   function showFrame(bytes){
     const url = URL.createObjectURL(new Blob([bytes], {type:'image/jpeg'}));
     feed.src = url;
-    if (camUrl) URL.revokeObjectURL(camUrl);   // the frame it just replaced
-    camUrl = url;
-    if (feed.classList.contains('dead')){      // first frame through
-      camTries = 0; feed.classList.remove('dead'); feedmsg.classList.remove('show');
-    }
-  }
-
-  function findBytes(hay, needle, from){
-    outer: for (let i = from; i + needle.length <= hay.length; i++){
-      for (let j = 0; j < needle.length; j++) if (hay[i+j] !== needle[j]) continue outer;
-      return i;
-    }
-    return -1;
-  }
-
-  async function camRead(signal){
-    const res = await fetch('/stream/video?t=' + Date.now(), {signal, cache:'no-store'});
-    if (!res.ok){                              // the car's own words, if it gave any
-      let why = 'HTTP ' + res.status;
-      try { const j = await res.json(); if (j && j.error) why = j.error; } catch {}
-      throw new Error(why);
-    }
-    if (!res.body) throw new Error('this browser cannot read the stream');
-
-    const enc = new TextEncoder();
-    const m = /boundary=(?:"([^"]+)"|([^;,\s]+))/i.exec(res.headers.get('Content-Type') || '');
-    if (!m) throw new Error('not a multipart stream');
-    const boundary = enc.encode('--' + (m[1] || m[2])), CRLF2 = enc.encode('\r\n\r\n');
-
-    const reader = res.body.getReader(), dec = new TextDecoder();
-    let buf = new Uint8Array(0), need = -1;
-    for (;;){
-      const {done, value} = await reader.read();
-      if (done) break;
-      const grown = new Uint8Array(buf.length + value.length);
-      grown.set(buf); grown.set(value, buf.length); buf = grown;
-
-      for (;;){
-        if (need < 0){                         // sitting on a part header
-          const start = findBytes(buf, boundary, 0);
-          if (start < 0) break;
-          const headEnd = findBytes(buf, CRLF2, start);
-          if (headEnd < 0){ buf = buf.slice(start); break; }
-          const cl = /content-length:[ \t]*(\d+)/i.exec(dec.decode(buf.subarray(start, headEnd)));
-          if (!cl) break;                      // our server always sends one
-          need = +cl[1];
-          buf = buf.subarray(headEnd + 4);
-        }
-        if (buf.length < need) break;          // frame still arriving
-        showFrame(buf.slice(0, need));
-        buf = buf.subarray(need);
-        need = -1;
-      }
-      buf = buf.slice();                       // drop the consumed chunk
-    }
-    throw new Error('the camera stopped sending');
+    // Keep the newest few alive rather than revoking the frame we just
+    // replaced: the <img> may still be decoding it, and pulling a blob URL out
+    // from under Safari mid-decode blanks the picture.
+    camUrls.push(url);
+    while (camUrls.length > 3) URL.revokeObjectURL(camUrls.shift());
+    camLive();
   }
 
   function camStop(){
     clearTimeout(camTimer); camTimer = null;
-    if (camAbort){ camAbort.abort(); camAbort = null; }   // frees the camera
+    camPolling = false;
+    feed.onload = feed.onerror = null;
+    if (camWs){ const s = camWs; camWs = null; try { s.close(); } catch {} }
     feed.removeAttribute('src');
-    if (camUrl){ URL.revokeObjectURL(camUrl); camUrl = null; }
+    while (camUrls.length) URL.revokeObjectURL(camUrls.pop());
     feed.classList.add('dead');
   }
+
+  function camRetry(why){
+    if (!$('camon').checked) return;
+    camTries++;
+    say('no camera — ' + (why || 'retrying') + ' — retrying…', true);
+    camTimer = setTimeout(camStart, Math.min(8000, 1000 * camTries));
+  }
+
   function camStart(){
     camStop();
     if (!$('camon').checked){ say('camera off', false); return; }
     say(camTries ? 'reconnecting to camera…' : 'connecting to camera…', true);
-    const ac = new AbortController(); camAbort = ac;
-    camRead(ac.signal).catch(err => {
-      if (ac.signal.aborted || !$('camon').checked) return;
-      camAbort = null;
-      camTries++;
-      say('no camera — ' + (err && err.message || 'retrying') + ' — retrying…', true);
-      camTimer = setTimeout(camStart, Math.min(8000, 1000 * camTries));
-    });
+
+    if (!window.WebSocket){ camPollStart(); return; }
+    let sock;
+    try {
+      const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      sock = new WebSocket(scheme + location.host + '/ws/video');
+    } catch { camPollStart(); return; }
+    sock.binaryType = 'arraybuffer';
+    camWs = sock;
+
+    sock.onmessage = ev => {
+      if (typeof ev.data === 'string'){        // the car explaining itself
+        let why = ev.data;
+        try { const j = JSON.parse(ev.data); if (j && j.error) why = j.error; } catch {}
+        camWs = null; try { sock.close(); } catch {}
+        camRetry(why);
+        return;
+      }
+      showFrame(ev.data);
+    };
+    sock.onerror = () => { try { sock.close(); } catch {} };
+    sock.onclose = () => {
+      if (camWs !== sock) return;              // we tore it down on purpose
+      camWs = null;
+      // Never got a single frame: the socket itself may be the problem, so
+      // drop to the one method that cannot be blocked.
+      if (feed.classList.contains('dead')) camPollStart();
+      else camRetry('the camera stopped sending');
+    };
+  }
+
+  function camPollStart(){
+    camPolling = true;
+    say('connecting to camera… (snapshot mode)', true);
+    feed.onload = () => {
+      if (!camPolling) return;
+      camLive();
+      camTimer = setTimeout(camPollNext, 60);
+    };
+    feed.onerror = () => {
+      if (!camPolling) return;
+      camPolling = false;
+      feed.onload = feed.onerror = null;
+      camRetry('snapshot failed');
+    };
+    camPollNext();
+  }
+  function camPollNext(){
+    if (!camPolling || !$('camon').checked) return;
+    feed.src = '/snapshot.jpg?t=' + Date.now();
   }
   $('camon').addEventListener('change', () => { camTries = 0; camStart(); });
   $('fit').addEventListener('change', () => {
@@ -1388,6 +1425,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE, "text/html; charset=utf-8")
         elif path == "/ws":
             self._websocket()
+        elif path == "/ws/video":
+            self._video_socket()
+        elif path in ("/snapshot.jpg", "/snapshot"):
+            self._snapshot()
         elif path == "/drive":
             self._drive(parsed.query)
         elif path == "/ping":
@@ -1479,12 +1520,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- websocket ----
 
-    def _websocket(self):
+    def _ws_upgrade(self):
+        """Answer the handshake. False if this was not a websocket request."""
         key = self.headers.get("Sec-WebSocket-Key")
         upgrade = (self.headers.get("Upgrade") or "").lower()
         if not key or "websocket" not in upgrade:
             self._json(400, {"error": "not a websocket handshake"})
-            return
+            return False
 
         self.close_connection = True
         self.wfile.write(
@@ -1493,6 +1535,11 @@ class Handler(BaseHTTPRequestHandler):
             b"Connection: Upgrade\r\n"
             b"Sec-WebSocket-Accept: " + ws_accept(key).encode("ascii") +
             b"\r\n\r\n")
+        return True
+
+    def _websocket(self):
+        if not self._ws_upgrade():
+            return
 
         peer = self.client_address[0]
         CONTROLLERS.join()
@@ -1519,7 +1566,7 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 try:
                     opcode, payload = conn.read(WS_PING)
-                except TimeoutError:
+                except TIMED_OUT:
                     quiet += 1
                     if quiet > WS_QUIET:
                         break                          # nothing home at all
@@ -1556,7 +1603,106 @@ class Handler(BaseHTTPRequestHandler):
             if remaining == 0:
                 stop_all("last controller disconnected")
 
+    # ---- video over a websocket ----
+
+    def _video_socket(self):
+        """Push whole JPEGs to one browser, one per binary message.
+
+        This is how the page actually watches the camera, because the two
+        obvious alternatives both fail on Safari and so on every iPhone:
+        an <img> pointed at a multipart/x-mixed-replace stream is not
+        rendered at all, and reading that stream with fetch() needs streaming
+        response bodies, which Safari only grew in 14.1 and still handles
+        oddly for multipart. A binary WebSocket has worked since Safari 6.
+
+        The protocol is deliberately trivial: a binary message is a frame, a
+        text message is the car explaining why there are none.
+        """
+        if not self._ws_upgrade():
+            return
+
+        conn = WSConn(self.connection)
+        stream = STREAMS.get("/stream/video")
+        if stream is None:
+            self._video_excuse(conn, "the camera is switched off on the car "
+                                     "(--no-camera)")
+            return
+
+        att, sub, error = stream.subscribe()
+        if error is not None:
+            _status, body, _ctype = error
+            try:
+                conn.write(body)               # ffmpeg's own words, as JSON
+            except OSError:
+                pass
+            return
+
+        try:
+            while True:
+                item = sub.get(1.0)
+                if item is None:
+                    if sub.ended:              # the capture stopped
+                        break
+                    if self._video_peer_done():
+                        break
+                    continue                   # nothing yet, keep waiting
+                if self._video_peer_done():
+                    break
+                conn.write(item, 0x2)          # binary: one whole JPEG
+        except (OSError, ValueError, struct.error):
+            pass                               # this viewer left
+        finally:
+            stream.unsubscribe(att, sub)
+
+    def _video_excuse(self, conn, message):
+        try:
+            conn.write(json.dumps({"error": message}).encode())
+        except OSError:
+            pass
+
+    def _video_peer_done(self):
+        """True once the browser is finished with the feed.
+
+        Nothing is expected from the page on this socket -- it is one way --
+        so anything readable at all, a close frame or an end of stream, means
+        we can let the camera go.
+        """
+        try:
+            return bool(select.select([self.connection], [], [], 0)[0])
+        except OSError:
+            return True
+
     # ---- streams ----
+
+    def _snapshot(self):
+        """One JPEG, as an ordinary image response.
+
+        The floor of the compatibility ladder: an <img> loading a normal JPEG
+        works in any browser that can show a picture at all. The page polls
+        this if it cannot get a websocket.
+        """
+        stream = STREAMS.get("/stream/video")
+        if stream is None:
+            self._json(503, {"error": "the camera is switched off on the car "
+                                      "(--no-camera)"})
+            return
+
+        att, sub, error = stream.subscribe()
+        if error is not None:
+            self._send(*error)
+            return
+        try:
+            deadline = time.monotonic() + START_WAIT
+            while time.monotonic() < deadline:
+                item = sub.get(1.0)
+                if item is not None:
+                    self._send(200, item, "image/jpeg")
+                    return
+                if sub.ended:
+                    break
+            self._json(504, {"error": "the camera sent no frame"})
+        finally:
+            stream.unsubscribe(att, sub)
 
     def _relay(self, stream):
         """Serve one browser its copy of a live feed."""

@@ -35,7 +35,8 @@ sudo apt update && sudo apt install -y ffmpeg python3-gpiozero v4l-utils
 ```
 
 That is the lot. Everything else is the Python standard library — no virtualenv,
-no `pip install`, no `requirements.txt`.
+no `pip install`, no `requirements.txt`. Python 3.9 or newer, which covers Pi OS
+Bullseye (3.9) and Bookworm (3.11); both are tested.
 
 ## Run
 
@@ -111,13 +112,40 @@ not a bug.
 
 ## Streams
 
-The camera and mic are started only while someone is watching and shut down when
-the last viewer leaves, so the webcam light is a reliable indicator. One capture
-process feeds everyone, so any number of people can watch at once.
+The camera and mic are started only while someone is watching and shut down a
+few seconds after the last viewer leaves, so the webcam light is a reliable
+indicator. One capture process feeds everyone, so any number of people can watch
+at once. (The few seconds of grace stop a reconnecting browser from restarting
+ffmpeg over and over — a webcam takes far longer to open than to serve.)
 
 Video is MJPEG copied straight from the webcam with no transcoding, so the Pi
 does almost no work. Audio is MP3, which is the one format that plays as a live
 stream in every browser, iPhones included.
+
+### How the page shows the camera
+
+Frames go to the browser over a **WebSocket**, one whole JPEG per binary
+message, and into an `<img>` as blob URLs.
+
+This is not the obvious choice, and the obvious choices are why an earlier
+version showed nothing at all on iPhones:
+
+- Pointing `<img src>` at a `multipart/x-mixed-replace` stream is the classic
+  MJPEG trick. Safari does not render it.
+- Reading that stream with `fetch()` and parsing the multipart body yourself
+  needs streaming response bodies. Safari only grew those in 14.1, and WebKit
+  still treats `multipart/x-mixed-replace` specially at the loader level.
+
+A binary WebSocket has worked since Safari 6 and iOS 6, needs no parsing in the
+page, and pushes frames rather than waiting to be asked for them.
+
+If a WebSocket cannot be opened at all, the page falls back to reloading
+`/snapshot.jpg` — nothing but an `<img>` loading an ordinary JPEG, which works
+in anything that can display a picture. It is a real feed, not a token gesture:
+roughly 15 frames a second on a LAN, off the same single capture.
+
+`/stream/video` is still served as ordinary MJPEG, so `vlc http://pi:8000/stream/video`
+and similar tools keep working. The page just no longer depends on it.
 
 ## Endpoints
 
@@ -125,10 +153,12 @@ stream in every browser, iPhones included.
 |-------|---------|
 | `GET /` | the joystick page |
 | `GET /ws` | WebSocket — the normal control path |
+| `GET /ws/video` | WebSocket — one whole JPEG per binary message; how the page watches |
+| `GET /snapshot.jpg` | a single JPEG; the page's fallback, and handy on its own |
 | `GET /drive?m1=&m2=&m3=` | all three motors in one request (HTTP fallback) |
 | `GET /motor1?power=-100..100` | one motor; also POST with `{"power": -40}` |
 | `GET /ping` | refreshes the failsafe on the fallback path |
-| `GET /stream/video` | MJPEG |
+| `GET /stream/video` | MJPEG, for VLC and other tools |
 | `GET /stream/audio` | MP3 |
 | `GET /health` | JSON status: motor state, viewers, time since last command |
 
@@ -151,6 +181,10 @@ Some webcams enumerate their mic on a different card from the video.
 
 **Status dot stays red.** The page is not getting acks. Check the Pi is
 reachable and look at `journalctl -u leonida -f` for control socket lines.
+
+**The feed says "snapshot mode".** The page could not open a video WebSocket and
+has fallen back to polling JPEGs. It works, but something is blocking WebSockets
+— usually a proxy between the phone and the Pi. Connect to the Pi directly.
 
 **Motors twitch but do not turn.** Raise **min speed** in settings.
 
