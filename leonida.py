@@ -35,14 +35,17 @@ by themselves within about half a second.
 """
 
 import argparse
+import array
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import select
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -67,6 +70,16 @@ VIDEO_QUEUE = 4            # frames held per browser before it starts skipping
 AUDIO_QUEUE = 48           # chunks held per browser
 MAX_FRAME_BUFFER = 4 * 1024 * 1024
 BOUNDARY = "leonida"       # our multipart boundary
+
+# ---- sound out of the car -------------------------------------------------
+
+SPEAK_RATE = 16000         # Hz, mono, signed 16-bit little-endian throughout
+SPEAK_CHUNK = SPEAK_RATE // 50            # 20ms of samples
+SPEAK_BYTES = SPEAK_CHUNK * 2
+SPEAK_QUEUE = 25           # ~half a second of speech held before dropping
+SPEAK_LINGER = 2.0         # keep the speaker open this long after it goes quiet
+HORN_TONES = (440.0, 550.0)               # a real car horn is two notes
+HORN_FADE = 0.005          # seconds; stops a click when the button is released
 
 # ---- depth overlay --------------------------------------------------------
 #
@@ -98,7 +111,8 @@ ASSET_SOURCES = [
     (f"{_MODEL}/model_fp16.onnx", DEPTH_MODEL),
 ]
 
-ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ASSET_DIR = os.path.join(HERE, "assets")
 ASSET_TYPES = {".mjs": "text/javascript", ".js": "text/javascript",
                ".wasm": "application/wasm", ".onnx": "application/octet-stream"}
 
@@ -228,14 +242,22 @@ def _log(changed):
 
 
 def stop_all(reason=None):
+    """Everything off: wheels and horn both.
+
+    A horn stuck on is arguably worse than a motor stuck on -- you cannot hear
+    yourself think while you go and fix it -- so it stops wherever the motors
+    stop, which means the STOP button and the space bar silence it too.
+    """
     with lock:
         moving = any(_state.values())
         for index, motor in MOTORS.items():
             motor.stop()
             _state[index] = 0.0
-    if reason and moving:
+    sounding = SPEAKER.horn
+    SPEAKER.set_horn(False)
+    if reason and (moving or sounding):
         print(f"  ** {reason} -- motors stopped")
-    return moving
+    return moving or sounding
 
 
 def watchdog():
@@ -250,7 +272,9 @@ def watchdog():
         time.sleep(WATCHDOG_TICK)
         with lock:
             moving = any(_state.values())
-        if not moving:
+        # The horn is held down from the page the same way the throttle is, so
+        # it needs the same deadman: lose the phone mid-blast and it stops.
+        if not moving and not SPEAKER.horn:
             continue
         if time.monotonic() - _last_command > DEADMAN:
             stop_all(f"no command for {DEADMAN:.1f}s")
@@ -463,11 +487,253 @@ def _kill(proc):
             proc.wait(timeout=2)
     except (OSError, subprocess.SubprocessError):
         pass
-    for pipe in (proc.stdout, proc.stderr):
+    # Any of these may be None -- the speaker sends its stdout to DEVNULL --
+    # and this runs from a finally block, where an exception would skip the
+    # cleanup that follows it.
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
         try:
             pipe.close()
         except (OSError, ValueError):
             pass
+
+
+# ---- the speaker ----------------------------------------------------------
+#
+# One ffmpeg writing to the headphone jack, fed by a thread that builds 20ms
+# chunks out of whatever is making noise: the horn, speech arriving from a
+# phone, or both at once. Started when something wants to be heard and stopped
+# a couple of seconds after the car goes quiet, so the jack is not held open
+# all day but a second horn press is still instant.
+
+
+def speaker_argv():
+    argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-fflags", "nobuffer",
+            "-f", "s16le", "-ar", str(SPEAK_RATE), "-ac", "1", "-i", "-"]
+    if CFG.speaker_format == "wav":        # writing a file, for testing
+        argv += ["-y", "-f", "wav", CFG.speaker_device]
+    else:
+        argv += ["-f", CFG.speaker_format, CFG.speaker_device]
+    return argv
+
+
+def horn_wave(tones):
+    """Exactly one second of the two-tone horn.
+
+    A whole second of whole-numbered frequencies contains a whole number of
+    cycles of each, so playing this buffer end to end forever is seamless --
+    no click at the loop point, and no arithmetic at all while it sounds.
+    """
+    n = SPEAK_RATE
+    wave = array.array("h", bytes(2 * n))
+    amp = 0.32                             # two tones summed, with headroom
+    for i in range(n):
+        t = i / SPEAK_RATE
+        v = sum(math.sin(2 * math.pi * f * t) for f in tones) * amp
+        wave[i] = int(max(-1.0, min(1.0, v)) * 32767)
+    return wave.tobytes()
+
+
+SILENCE = bytes(SPEAK_BYTES)
+HORN_WAVE = b""            # built in main(), once CFG.horn_tones is known
+
+
+def mix(a, b):
+    """Sum two equal-length S16LE buffers, clipping rather than wrapping.
+
+    Only reached when the horn and someone talking overlap; a single source is
+    passed through untouched. Deliberately not audioop, which was removed in
+    Python 3.13 and would strand this on older interpreters only.
+    """
+    xa = array.array("h")
+    xa.frombytes(a)
+    xb = array.array("h")
+    xb.frombytes(b)
+    for i in range(len(xa)):
+        v = xa[i] + xb[i]
+        xa[i] = 32767 if v > 32767 else (-32768 if v < -32768 else v)
+    return xa.tobytes()
+
+
+class Speaker:
+    """Everything the car says out loud."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread = None
+        self.horn = False
+        self.at = 0                        # position in the horn loop, samples
+        self.fade = 0                      # samples of fade-out still owed
+        self.buf = bytearray()             # speech waiting to be played
+        self.primed = False                # jitter buffer has enough to start
+        self.last_speech = 0.0
+        self.error = None
+
+    # ---- what the rest of the program calls ----
+
+    def set_horn(self, on):
+        with self.lock:
+            if on == self.horn:
+                return
+            self.horn = on
+            if not on:
+                # Cutting a sine mid-cycle is a click. Ramp it out instead.
+                self.fade = int(HORN_FADE * SPEAK_RATE)
+        if on:
+            self._ensure()
+
+    def speak(self, pcm):
+        with self.lock:
+            self.buf.extend(pcm)
+            limit = SPEAK_QUEUE * SPEAK_BYTES
+            if len(self.buf) > limit:      # a slow link falls behind, not lags
+                del self.buf[:len(self.buf) - limit]
+            if len(self.buf) >= 2 * SPEAK_BYTES:
+                self.primed = True
+            self.last_speech = time.monotonic()
+        self._ensure()
+
+    def hush(self):
+        """Everything off, right now."""
+        with self.lock:
+            self.horn = False
+            self.fade = 0
+            self.buf.clear()
+            self.primed = False
+
+    def status(self):
+        with self.lock:
+            return {"horn": self.horn,
+                    "speaking": bool(self.buf),
+                    "live": self.thread is not None,
+                    "device": CFG.speaker_device if CFG else None,
+                    "error": self.error}
+
+    # ---- the pipeline ----
+
+    def _ensure(self):
+        with self.lock:
+            if self.thread is not None:
+                return
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def _next(self):
+        """The next 20ms to play, or None if there is nothing to say."""
+        with self.lock:
+            horn, fade = self.horn, self.fade
+            speech = None
+            if self.primed and len(self.buf) >= SPEAK_BYTES:
+                speech = bytes(self.buf[:SPEAK_BYTES])
+                del self.buf[:SPEAK_BYTES]
+                if not self.buf:
+                    self.primed = False    # wait for a cushion before resuming
+            elif self.buf and time.monotonic() - self.last_speech > 0.2:
+                speech = bytes(self.buf).ljust(SPEAK_BYTES, b"\0")   # last words
+                self.buf.clear()
+                self.primed = False
+
+            tone = None
+            if horn or fade:
+                tone = self._tone(fade)
+
+        if tone is None:
+            return speech
+        if speech is None:
+            return tone
+        return mix(tone, speech)
+
+    def _tone(self, fade):
+        """One chunk of horn. Caller holds the lock."""
+        start = self.at
+        chunk = HORN_WAVE[start * 2:(start + SPEAK_CHUNK) * 2]
+        self.at = (start + SPEAK_CHUNK) % SPEAK_RATE
+
+        if not fade:
+            return chunk
+        # Ramp the last few milliseconds down to nothing, then go quiet.
+        out = array.array("h")
+        out.frombytes(chunk)
+        for i in range(len(out)):
+            if i < fade:
+                out[i] = int(out[i] * (1 - i / fade))
+            else:
+                out[i] = 0
+        self.fade = 0
+        return out.tobytes()
+
+    def _run(self):
+        proc = None
+        errors = []
+        try:
+            proc = subprocess.Popen(speaker_argv(), stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+            threading.Thread(target=_drain, args=(proc.stderr, errors),
+                             daemon=True).start()
+            print("  [speaker] on")
+            self.error = None
+
+            # Paced by the clock rather than by the device blocking, so that
+            # pointing this at a file for testing produces audio of the right
+            # length instead of everything at once.
+            quiet_since = None
+            deadline = time.monotonic()
+            while True:
+                chunk = self._next()
+                if chunk is None:
+                    now = time.monotonic()
+                    if quiet_since is None:
+                        quiet_since = now
+                    elif now - quiet_since > SPEAK_LINGER:
+                        break
+                    chunk = SILENCE
+                else:
+                    quiet_since = None
+
+                proc.stdin.write(chunk)
+                proc.stdin.flush()
+
+                deadline += SPEAK_CHUNK / SPEAK_RATE
+                nap = deadline - time.monotonic()
+                if nap > 0:
+                    time.sleep(nap)
+                else:
+                    deadline = time.monotonic()      # fell behind; resync
+        except (OSError, ValueError) as e:
+            self.error = f"speaker failed: {e}"
+            if errors:
+                self.error = errors[-1]
+            print(f"  [speaker] {self.error}")
+        finally:
+            # Whatever went wrong above, the thread handle has to be cleared or
+            # the speaker can never be started again.
+            try:
+                if proc is not None:
+                    # Closing stdin is an end-of-input, which lets ffmpeg finish
+                    # of its own accord. That matters when the output is a file:
+                    # killed mid-write, a WAV never gets its header and is
+                    # unreadable. Only force it if it will not go quietly.
+                    if proc.stdin is not None:
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    _kill(proc)
+                    print("  [speaker] off")
+            except Exception as e:                    # never leave it wedged
+                print(f"  [speaker] shutdown: {e}")
+            with self.lock:
+                self.thread = None
+
+
+SPEAKER = Speaker()
 
 
 # ---- framing --------------------------------------------------------------
@@ -890,9 +1156,31 @@ def check_camera():
     return 0
 
 
+def detect_speaker_device():
+    """First ALSA playback device, preferring the headphone jack.
+
+    A Pi with a monitor attached usually enumerates HDMI first, and sending the
+    horn to a monitor's speakers is a confusing way to find that out.
+    """
+    try:
+        out = subprocess.run(["aplay", "-l"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return "default"
+    cards = re.findall(r"^card (\d+): (\S+).*?device (\d+):", out, re.M)
+    if not cards:
+        return "default"
+    for num, name, dev in cards:
+        if "headphone" in name.lower() or "audiojack" in name.lower():
+            return f"plughw:{num},{dev}"
+    num, _name, dev = cards[0]
+    return f"plughw:{num},{dev}"
+
+
 def list_devices():
     for label, argv in (("cameras", ["v4l2-ctl", "--list-devices"]),
-                        ("microphones", ["arecord", "-l"])):
+                        ("microphones", ["arecord", "-l"]),
+                        ("speakers", ["aplay", "-l"])):
         print(f"\n--- {label} ---")
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
@@ -1128,6 +1416,28 @@ PAGE = r"""<!doctype html>
     bottom:calc(16px + env(safe-area-inset-bottom));
     display:flex; flex-direction:column; gap:6px; width:150px;
   }
+
+  /* Horn and speak: left side, above the telemetry, so the thumb that is not
+     driving can reach them. Held down, not toggled. */
+  .noise{
+    position:absolute; left:calc(12px + env(safe-area-inset-left));
+    bottom:calc(150px + env(safe-area-inset-bottom));
+    display:flex; flex-direction:column; gap:10px;
+  }
+  .hold{
+    width:74px; height:74px; border-radius:50%; touch-action:none;
+    border:1px solid rgba(255,255,255,.2); background:rgba(13,17,23,.6);
+    -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
+    color:var(--ink); font-size:11px; font-weight:700; letter-spacing:.04em;
+    cursor:pointer; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:3px; line-height:1; user-select:none;
+    -webkit-user-select:none;
+  }
+  .hold .glyph{font-size:22px;line-height:1}
+  .hold.live{background:rgba(63,185,80,.85);border-color:#fff;color:#08130c;
+              box-shadow:0 0 18px rgba(63,185,80,.6)}
+  .hold.busy{opacity:.6}
+  .hold[disabled]{opacity:.35;cursor:not-allowed}
   .mtr{
     background:rgba(13,17,23,.6); border:1px solid rgba(255,255,255,.14);
     -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
@@ -1184,6 +1494,13 @@ PAGE = r"""<!doctype html>
     <h1>Leonida</h1>
     <button class="btn" id="mute" title="toggle audio (M)">&#128263; Audio off</button>
     <button class="btn" id="gear" title="settings">&#9881;</button>
+  </div>
+
+  <div class="noise">
+    <button class="hold" id="hornbtn" title="hold to sound the horn (H)">
+      <span class="glyph">&#128266;</span><span>HORN</span></button>
+    <button class="hold" id="speakbtn" title="hold to talk through the car (V)">
+      <span class="glyph">&#127908;</span><span>SPEAK</span></button>
   </div>
 
   <div class="telemetry">
@@ -1379,6 +1696,41 @@ async function frame(buf){
 }
 
 function post(m, transfer){ self.postMessage(m, transfer || []); }
+</script>
+
+<!-- Microphone capture. Runs on the browser's audio thread, where it cannot be
+     delayed by anything the page is doing, and hands up whole 20ms lumps so
+     the main thread is woken 50 times a second rather than 375. -->
+<script id="micworklet" type="text/plain">
+class Mic extends AudioWorkletProcessor {
+  constructor(opts){
+    super();
+    // The car plays 16 kHz. If the browser would not give us that rate, walk
+    // through the input at a fraction of a sample per step instead -- rough,
+    // but this is speech through a small speaker on a car.
+    this.ratio = sampleRate / opts.processorOptions.rate;
+    this.out = new Int16Array(opts.processorOptions.chunk);
+    this.n = 0;
+    this.pos = 0;
+  }
+  process(inputs){
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    let p = this.pos;
+    while (p < ch.length){
+      const v = ch[p | 0];
+      this.out[this.n++] = Math.max(-1, Math.min(1, v)) * 32767;
+      if (this.n === this.out.length){
+        this.port.postMessage(this.out.slice());
+        this.n = 0;
+      }
+      p += this.ratio;
+    }
+    this.pos = p - ch.length;      // carry the fraction into the next block
+    return true;
+  }
+}
+registerProcessor('mic', Mic);
 </script>
 
 <script>
@@ -1594,6 +1946,9 @@ function post(m, transfer){ self.postMessage(m, transfer || []); }
     lastSent = '';                 // force the stop out even if we just sent 0
     sendAll(0, 0, 0);
     ui(1,0); ui(2,0); ui(3,0);
+    // The car silences the horn whenever it stops the wheels, so the button
+    // has to stop claiming otherwise.
+    horn(false);
   }
   $('stop').addEventListener('click', stopAll);
   addEventListener('blur', () => { if (active || keys.size) stopAll(); });
@@ -1749,6 +2104,145 @@ function post(m, transfer){ self.postMessage(m, transfer || []); }
     if (!camPolling || !$('camon').checked) return;
     feed.src = '/snapshot.jpg?t=' + Date.now();
   }
+  // ---- horn and speak ----------------------------------------------------
+  // Both are held, not toggled, and both are released by anything that takes
+  // the page away -- the car should never be left making a noise nobody meant.
+  const SPEAK_RATE = 16000, SPEAK_CHUNK = 320;   // 20ms, matching the car
+  const hornBtn = $('hornbtn'), speakBtn = $('speakbtn');
+  let hornOn = false;
+
+  function horn(on){
+    if (on === hornOn) return;
+    hornOn = on;
+    hornBtn.classList.toggle('live', on);
+    if (ws && ws.readyState === 1) ws.send(on ? 'h1' : 'h0');
+    else viaHttp('/horn?on=' + (on ? 1 : 0));
+  }
+
+  // ---- speak: this browser's microphone, out of the car's speaker ----
+  let micWs = null, micCtx = null, micNode = null, micStream = null;
+  let speaking = false, micBusy = false, wantSpeak = false;
+
+  function speakLabel(text){ speakBtn.title = text; }
+
+  async function speakStart(){
+    wantSpeak = true;
+    if (speaking || micBusy) return;
+    // getUserMedia only exists in a secure context. Over plain http the whole
+    // API is simply absent, which is a confusing way to find out, so say it.
+    if (!navigator.mediaDevices || !window.isSecureContext){
+      speakBtn.disabled = true;
+      speakLabel('the microphone needs https -- run: python3 leonida.py --make-cert');
+      return;
+    }
+    micBusy = true;
+    speakBtn.classList.add('busy');
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({audio:{
+        echoCancellation:true, noiseSuppression:true,
+        autoGainControl:true, channelCount:1}});
+
+      micCtx = new (window.AudioContext || window.webkitAudioContext)(
+        {sampleRate: SPEAK_RATE});
+      const src = micCtx.createMediaStreamSource(micStream);
+      const code = $('micworklet').textContent;
+      const url = URL.createObjectURL(new Blob([code], {type:'text/javascript'}));
+      await micCtx.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+
+      micWs = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://')
+                            + location.host + '/ws/mic');
+      micWs.binaryType = 'arraybuffer';
+
+      micNode = new AudioWorkletNode(micCtx, 'mic', {
+        processorOptions: {rate: SPEAK_RATE, chunk: SPEAK_CHUNK}});
+      micNode.port.onmessage = ev => {
+        if (micWs && micWs.readyState === 1) micWs.send(ev.data.buffer);
+      };
+      src.connect(micNode);
+      // Not connected to the destination on purpose: routing the microphone to
+      // this phone's own speaker is how you start a feedback loop.
+
+      // Asking for the microphone takes a moment, and the first time it waits
+      // on a permission dialog. If the button was let go in the meantime, this
+      // must not come up live and stay that way.
+      if (!wantSpeak){ speakStop(); return; }
+
+      speaking = true;
+      speakBtn.classList.add('live');
+      speakLabel('talking through the car');
+      // The car's own microphone playing here while the car's speaker is
+      // talking is the other way to start one.
+      if (listening){ audio.pause(); }
+    } catch (err) {
+      speakLabel(err && err.name === 'NotAllowedError'
+                 ? 'microphone permission refused'
+                 : 'microphone unavailable: ' + (err && err.message || err));
+      speakStop();
+    } finally {
+      micBusy = false;
+      speakBtn.classList.remove('busy');
+    }
+  }
+
+  function speakStop(){
+    wantSpeak = false;
+    speaking = false;
+    speakBtn.classList.remove('live');
+    if (micNode){ try { micNode.port.onmessage = null; micNode.disconnect(); } catch {} micNode = null; }
+    if (micStream){ micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (micCtx){ const c = micCtx; micCtx = null; c.close().catch(() => {}); }
+    if (micWs){ const s = micWs; micWs = null; try { s.close(); } catch {} }
+    if (listening) audio.play().catch(() => {});      // give the car's ears back
+  }
+
+  // ---- holding the buttons ----
+  function holdable(btn, down, up){
+    let held = false;
+    btn.addEventListener('pointerdown', e => {
+      if (btn.disabled) return;
+      e.preventDefault();                 // no focus, so space still means stop
+      held = true;
+      try { btn.setPointerCapture(e.pointerId); } catch {}
+      down();
+    });
+    const release = () => { if (held){ held = false; up(); } };
+    btn.addEventListener('pointerup', release);
+    btn.addEventListener('pointercancel', release);
+    // Also on the window: if capture did not take, the release can land
+    // somewhere else entirely, and a horn that never hears about it is stuck.
+    addEventListener('pointerup', release);
+    addEventListener('pointercancel', release);
+    btn.addEventListener('contextmenu', e => e.preventDefault());
+    return release;
+  }
+  const hornRelease = holdable(hornBtn, () => horn(true), () => horn(false));
+  const speakRelease = holdable(speakBtn, speakStart, speakStop);
+
+  // Same two, from the keyboard. Held down, and repeat events ignored.
+  let hKey = false, vKey = false;
+  addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    const k = e.key.toLowerCase();
+    if (k === 'h' && !hKey){ hKey = true; e.preventDefault(); horn(true); }
+    else if (k === 'v' && !vKey){ vKey = true; e.preventDefault(); speakStart(); }
+  });
+  addEventListener('keyup', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'h'){ hKey = false; horn(false); }
+    else if (k === 'v'){ vKey = false; speakStop(); }
+  });
+
+  function quiet(){ horn(false); speakStop(); }
+  addEventListener('blur', quiet);
+  addEventListener('pagehide', quiet);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) quiet(); });
+
+  if (!window.isSecureContext){
+    speakBtn.disabled = true;
+    speakLabel('the microphone needs https -- run: python3 leonida.py --make-cert');
+  }
+
   // ---- depth overlay -----------------------------------------------------
   // The model runs in the worker above, in this browser, on frames that have
   // already arrived for display. The car does no part of it and cannot be
@@ -1967,6 +2461,28 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def _send_cert(self):
+        """Hand out the certificate so a phone can be told to trust it.
+
+        The certificate only -- it is public by nature, it is sent to every
+        client during every handshake anyway. The private key next to it is
+        never served by any route here, and that is deliberate.
+        """
+        try:
+            with open(CFG.cert, "rb") as f:
+                body = f.read()
+        except OSError:
+            self._json(404, {"error": "no certificate -- run "
+                                      "python3 leonida.py --make-cert"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-pem-file")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="leonida-cert.pem"')
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_body(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1978,7 +2494,26 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- routing ----
 
+    def _plaintext_on_a_tls_port(self):
+        """True if this request arrived unencrypted on an HTTPS server."""
+        return (self.server.tls is not None
+                and not isinstance(self.connection, ssl.SSLSocket))
+
+    def _redirect_to_https(self):
+        host = self.headers.get("Host") or f"{local_ip()}:{CFG.port}"
+        body = b"This car speaks HTTPS.\n"
+        self.send_response(301)
+        self.send_header("Location", f"https://{host}{self.path}")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        if self._plaintext_on_a_tls_port():
+            self._redirect_to_https()
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
@@ -1988,15 +2523,21 @@ class Handler(BaseHTTPRequestHandler):
             self._websocket()
         elif path == "/ws/video":
             self._video_socket()
+        elif path == "/ws/mic":
+            self._mic_socket()
         elif path in ("/snapshot.jpg", "/snapshot"):
             self._snapshot()
         elif path.startswith("/assets/"):
             self._send_asset(path[len("/assets/"):])
+        elif path == "/leonida-cert.pem":
+            self._send_cert()
         elif path == "/drive":
             self._drive(parsed.query)
         elif path == "/ping":
             touch()
             self._json(200, {"ok": True})
+        elif path == "/horn":
+            self._horn(parsed.query)
         elif path == "/health":
             self._health()
         elif path in STREAMS:
@@ -2043,6 +2584,18 @@ class Handler(BaseHTTPRequestHandler):
         set_all(*powers)
         self._json(200, {"m1": powers[0], "m2": powers[1], "m3": powers[2]})
 
+    def _horn(self, query):
+        """The horn, for the HTTP fallback path. Held, not toggled."""
+        values = parse_qs(query).get("on")
+        raw = (values[0] if values else "").strip().lower()
+        if raw not in ("0", "1", "true", "false", "on", "off"):
+            self._json(400, {"error": "on must be 0 or 1"})
+            return
+        on = raw in ("1", "true", "on")
+        SPEAKER.set_horn(on)
+        touch()
+        self._json(200, {"horn": on})
+
     def _motor(self, index, query):
         """One motor, the way the old motor API did it."""
         values = parse_qs(query).get("power")
@@ -2080,6 +2633,7 @@ class Handler(BaseHTTPRequestHandler):
             "since_last_command": round(time.monotonic() - _last_command, 3),
             "deadman": DEADMAN,
             "depth_assets": depth_ready(),
+            "speaker": SPEAKER.status(),
         })
 
     # ---- websocket ----
@@ -2148,6 +2702,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 message = payload.decode("utf-8", "replace")
                 if message == "p":
+                    touch()
+                elif message == "h1":
+                    SPEAKER.set_horn(True)
+                    touch()
+                elif message == "h0":
+                    SPEAKER.set_horn(False)
                     touch()
                 elif not drive_from_text(message):
                     continue
@@ -2236,6 +2796,55 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return True
 
+    # ---- speech from a phone ----
+
+    def _mic_socket(self):
+        """Take raw audio from a browser and play it out of the car.
+
+        Its own socket, not the control one: a 640-byte lump of speech must
+        never sit in the queue ahead of a steering command. Binary messages are
+        16 kHz mono signed 16-bit -- no codec, because decoding one would cost
+        the Pi time and latency for no benefit on a local network.
+        """
+        if not self._ws_upgrade():
+            return
+        if CFG.no_speaker:
+            try:
+                WSConn(self.connection).write(json.dumps(
+                    {"error": "the speaker is switched off on the car "
+                              "(--no-speaker)"}).encode())
+            except OSError:
+                pass
+            return
+
+        conn = WSConn(self.connection)
+        peer = self.client_address[0]
+        print(f"  + speaking from {peer}")
+        heard = 0
+        try:
+            while True:
+                try:
+                    opcode, payload = conn.read(WS_PING)
+                except TIMED_OUT:
+                    conn.write(b"", 0x9)           # still there?
+                    continue
+                if opcode == 0x8:                  # close
+                    break
+                if opcode == 0x9:
+                    conn.write(payload, 0xA)
+                    continue
+                if opcode != 0x2:                  # only binary carries audio
+                    continue
+                if len(payload) % 2:
+                    payload = payload[:-1]         # keep whole samples
+                if payload:
+                    SPEAKER.speak(payload)
+                    heard += len(payload)
+        except (OSError, ValueError, struct.error):
+            pass
+        finally:
+            print(f"  - speaking from {peer} ({heard / (SPEAK_RATE * 2):.1f}s)")
+
     # ---- streams ----
 
     def _snapshot(self):
@@ -2314,12 +2923,114 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not select.select([sock], [], [], 0)[0]:
                 return False
+            if isinstance(sock, ssl.SSLSocket):
+                # SSLSocket.recv rejects any flag, so MSG_PEEK is out. Read for
+                # real instead -- this is a one-way stream, the browser never
+                # sends anything on it, so there is nothing to consume but the
+                # close itself. Non-blocking, because a half-arrived TLS record
+                # would otherwise stall this thread and hold the camera open.
+                try:
+                    sock.settimeout(0.0)
+                    return sock.recv(4096) == b""
+                except (ssl.SSLWantReadError, BlockingIOError):
+                    return False          # nothing decodable yet, still there
+                finally:
+                    sock.settimeout(None)
             return sock.recv(4096, socket.MSG_PEEK) == b""
-        except OSError:
+        except (OSError, ValueError):
             return True
 
 
 # ---- startup --------------------------------------------------------------
+
+
+def make_cert():
+    """A self-signed certificate for this Pi.
+
+    The microphone is why this exists: browsers only hand it over in a secure
+    context, so the page has to be served over HTTPS even on a home network.
+
+    The subjectAltName is the part that matters. Browsers have ignored the
+    Common Name for years and will reject a certificate that does not name the
+    address you typed, so every way of reaching this Pi goes in the list.
+    """
+    host = socket.gethostname().split(".")[0]
+    names = ["DNS:localhost", "IP:127.0.0.1", f"DNS:{host}", f"DNS:{host}.local"]
+    ip = local_ip()
+    if ip != "127.0.0.1":
+        names.append(f"IP:{ip}")
+
+    argv = ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", CFG.key, "-out", CFG.cert, "-days", "3650",
+            "-subj", f"/CN={host}", "-addext", "subjectAltName=" + ",".join(names)]
+    print(f"\n  making a certificate for {', '.join(names)}")
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        print("  openssl is not installed:  sudo apt install -y openssl\n")
+        return 1
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  could not run openssl: {e}\n")
+        return 1
+    if r.returncode != 0:
+        print(f"  openssl failed:\n{r.stderr.strip()}\n")
+        return 1
+
+    try:
+        os.chmod(CFG.key, 0o600)           # the key is the whole secret
+    except OSError:
+        pass
+    print(f"    certificate  {CFG.cert}")
+    print(f"    private key  {CFG.key}  (never leaves the Pi)")
+    print("\n  Start the car and open the https:// address it prints. Your "
+          "browser will\n  warn once, because nobody has vouched for this "
+          "certificate but itself.\n  To stop the warning -- and on an iPhone, "
+          "to let Safari use the microphone --\n  open  /leonida-cert.pem  on "
+          "the device and trust it.\n")
+    return 0
+
+
+def tls_context():
+    """An SSL context if we have a certificate, else None."""
+    if CFG.no_tls:
+        return None
+    if not (os.path.isfile(CFG.cert) and os.path.isfile(CFG.key)):
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(CFG.cert, CFG.key)
+    return ctx
+
+
+class CarServer(ThreadingHTTPServer):
+    """Serves HTTPS, and is kind to anyone who arrives over plain HTTP.
+
+    Typing an address without a scheme still gets you http://, and a TLS
+    listener answers that with a failed handshake -- which looks exactly like
+    the car being down. So peek at the first byte: a TLS handshake starts with
+    0x16, and anything else is someone knocking in plaintext, who gets left
+    unwrapped so the handler can redirect them.
+    """
+
+    tls = None
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        if self.tls is None:
+            return sock, addr
+        try:
+            # Bounded, because this runs on the accept loop: a client that
+            # connects and then says nothing must not hold up everyone else.
+            sock.settimeout(5)
+            first = sock.recv(1, socket.MSG_PEEK)
+            sock.settimeout(None)
+            if first == b"\x16":
+                sock = self.tls.wrap_socket(sock, server_side=True)
+        except (OSError, ValueError, ssl.SSLError) as e:
+            try:
+                sock.close()
+            finally:
+                raise OSError(f"handshake from {addr[0]} failed: {e}")
+        return sock, addr
 
 
 def _terminate(signum, frame):
@@ -2367,6 +3078,23 @@ def main():
                     help="grab one frame, report what is in it, then exit")
     ap.add_argument("--fetch-model", action="store_true",
                     help="download the depth-overlay runtime and model, then exit")
+
+    ap.add_argument("--speaker-device", default="auto",
+                    help='ALSA playback device, or "auto" for the headphone jack')
+    ap.add_argument("--speaker-format", default="alsa",
+                    help="ffmpeg output format (audiotoolbox on a Mac, "
+                         "wav to write a file)")
+    ap.add_argument("--no-speaker", action="store_true",
+                    help="no horn and no speech; the car stays silent")
+    ap.add_argument("--horn-tones", default="440,550",
+                    help="horn frequencies in Hz, whole numbers, comma separated")
+
+    ap.add_argument("--cert", default=os.path.join(HERE, "cert.pem"))
+    ap.add_argument("--key", default=os.path.join(HERE, "key.pem"))
+    ap.add_argument("--make-cert", action="store_true",
+                    help="generate a self-signed certificate, then exit")
+    ap.add_argument("--no-tls", action="store_true",
+                    help="serve plain HTTP even if a certificate exists")
     CFG = ap.parse_args()
 
     if CFG.list_devices:
@@ -2379,8 +3107,26 @@ def main():
     if CFG.check_camera:
         sys.exit(check_camera())
 
+    if CFG.make_cert:
+        sys.exit(make_cert())
+
     if CFG.audio_device == "auto":
         CFG.audio_device = detect_audio_device()
+    if CFG.speaker_device == "auto":
+        CFG.speaker_device = ("none" if CFG.no_speaker
+                              else detect_speaker_device())
+
+    global HORN_WAVE
+    try:
+        tones = [round(float(t)) for t in CFG.horn_tones.split(",") if t.strip()]
+    except ValueError:
+        tones = []
+    if not tones:
+        print(f"  bad --horn-tones {CFG.horn_tones!r}; using 440,550")
+        tones = [440, 550]
+    # Rounded to whole hertz on purpose: a whole second then holds a whole
+    # number of cycles, so the loop is seamless and the horn never clicks.
+    HORN_WAVE = horn_wave(tones)
 
     if not CFG.no_camera:
         STREAMS["/stream/video"] = Stream(
@@ -2399,15 +3145,23 @@ def main():
     # the same shutdown path as Ctrl-C so `systemctl stop` parks the car.
     signal.signal(signal.SIGTERM, _terminate)
 
-    server = ThreadingHTTPServer(("0.0.0.0", CFG.port), Handler)
+    server = CarServer(("0.0.0.0", CFG.port), Handler)
+    server.tls = tls_context()
+    scheme = "https" if server.tls else "http"
+
     ip = local_ip()
     print()
     print(f"  Leonida ready{'  [MOCK MODE - no motors]' if MOCK else ''}")
-    print(f"    drive it   http://{ip}:{CFG.port}/")
+    print(f"    drive it   {scheme}://{ip}:{CFG.port}/")
     print(f"    camera     {CFG.video_device if not CFG.no_camera else 'off'}")
     print(f"    mic        {CFG.audio_device if not CFG.no_audio else 'off'}")
+    print(f"    speaker    {CFG.speaker_device if not CFG.no_speaker else 'off'}")
     print(f"    failsafe   motors stop after {DEADMAN:.1f}s of silence")
     print(f"    depth      {'available (browser-side)' if depth_ready() else 'off -- run --fetch-model to enable'}")
+    if not server.tls:
+        # Worth saying plainly: without this the Speak button cannot work at
+        # all, and the reason is not obvious from the browser's error.
+        print("    speak      unavailable over http -- run --make-cert")
     print("    Ctrl-C to quit")
     print()
 
@@ -2418,6 +3172,7 @@ def main():
     finally:
         server.shutdown()
         stop_all()
+        SPEAKER.hush()
         print("\nMotors stopped.")
 
 

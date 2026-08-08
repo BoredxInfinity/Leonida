@@ -10,3 +10,7 @@ venv/
 
 # Depth-overlay runtime and model, ~70MB, fetched with --fetch-model
 assets/
+
+# This Pi's own certificate. The key especially must never be committed.
+cert.pem
+key.pem

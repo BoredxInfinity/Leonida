@@ -22,7 +22,8 @@ Three motors on an H-bridge, wired to these BCM pins:
 | 2 | rear drive | GPIO 20 | GPIO 21 |
 | 3 | steering | GPIO 18 | GPIO 19 |
 
-Plus one USB webcam, which supplies both the video and the microphone.
+Plus one USB webcam, which supplies both the video and the microphone, and a
+speaker in the headphone jack if you want the car to make noise.
 
 If a drive motor is wired backwards, tick its invert box in the page's settings
 rather than rewiring. If steering goes the wrong way, invert steering there too —
@@ -50,6 +51,9 @@ It prints the URL to open. Useful flags:
 python3 leonida.py --list-devices          # what cameras and mics can it see?
 python3 leonida.py --check-camera          # grab one frame and inspect it
 python3 leonida.py --fetch-model           # download the depth model, once
+python3 leonida.py --make-cert             # enable https, needed for Speak
+python3 leonida.py --speaker-device plughw:1,0
+python3 leonida.py --no-speaker            # no horn, no speech
 python3 leonida.py --width 1280 --height 720 --fps 15
 python3 leonida.py --video-device /dev/video2
 python3 leonida.py --audio-device plughw:2,0
@@ -149,6 +153,59 @@ roughly 15 frames a second on a LAN, off the same single capture.
 `/stream/video` is still served as ordinary MJPEG, so `vlc http://pi:8000/stream/video`
 and similar tools keep working. The page just no longer depends on it.
 
+## Horn and Speak
+
+Two hold-down buttons on the left of the page, reachable with the thumb that is
+not driving. Keyboard: hold **H** for the horn, **V** to speak.
+
+- **Horn** — a two-tone drone, 440 Hz and 550 Hz together, the interval a real
+  car horn uses. Exactly one second of it is worked out when the program starts,
+  and because both frequencies are whole numbers that second loops seamlessly,
+  so sounding the horn costs the Pi no arithmetic at all. It fades out over a
+  few milliseconds on release rather than stopping mid-cycle, which would click.
+- **Speak** — your phone's microphone, played out of the car. Audio is captured
+  on the browser's audio thread, sent as plain 16 kHz PCM over its own
+  WebSocket, and played by the same pipeline as the horn. If both are held at
+  once they are mixed.
+
+The horn cannot get stuck on. It stops when you release it, when you press STOP
+or space, when the last controller disconnects, and — the one that matters —
+when the car stops hearing from the page for 0.6 s, the same deadman that stops
+the wheels. Drive out of range mid-blast and it goes quiet on its own.
+
+Set the output with `--speaker-device`; by default it finds the headphone jack
+in `aplay -l`, preferring it over HDMI, which is where a Pi with a monitor
+attached would otherwise send the horn. `--horn-tones 350,420` changes the note
+(whole numbers of hertz, or the loop clicks) and `--no-speaker` keeps the car
+silent.
+
+### Speak needs HTTPS
+
+Browsers only hand over a microphone in a secure context. Over plain `http://`
+to an IP address the API is not merely refused, `navigator.mediaDevices` does
+not exist at all — so the Speak button disables itself and says so. Everything
+else works fine over http.
+
+```bash
+python3 leonida.py --make-cert
+```
+
+That writes `cert.pem` and `key.pem` next to the program, naming this Pi's
+address, hostname and `.local` name, and from then on the car serves HTTPS. Both
+files are gitignored; the key is never served by any route.
+
+The first visit warns, because nothing has vouched for this certificate but
+itself — click through and it works. To stop the warning, and **on an iPhone to
+let Safari use the microphone at all**, open `/leonida-cert.pem` on the device
+and trust it (on iOS: install the profile, then enable it under Settings →
+General → About → Certificate Trust Settings).
+
+If the Pi's address changes, the certificate no longer matches and the warning
+comes back — give it a static DHCP lease, or use the `.local` name.
+
+Arriving on `http://` after switching to HTTPS does not hang: the car notices
+the connection is not a TLS handshake and redirects you.
+
 ## Depth overlay (optional)
 
 A monocular depth model can be laid over the camera feed — near things red, far
@@ -214,7 +271,10 @@ Driving comes first.
 | `GET /assets/<file>` | the depth runtime and model, if fetched (cached hard) |
 | `GET /drive?m1=&m2=&m3=` | all three motors in one request (HTTP fallback) |
 | `GET /motor1?power=-100..100` | one motor; also POST with `{"power": -40}` |
+| `GET /ws/mic` | WebSocket — 16 kHz PCM from a phone, played by the car |
+| `GET /horn?on=1` | the horn, for the HTTP fallback path |
 | `GET /ping` | refreshes the failsafe on the fallback path |
+| `GET /leonida-cert.pem` | this Pi's certificate, for trusting on a phone |
 | `GET /stream/video` | MJPEG, for VLC and other tools |
 | `GET /stream/audio` | MP3 |
 | `GET /health` | JSON status: motor state, viewers, time since last command |
@@ -266,6 +326,18 @@ Two things it checks for specifically:
   live feed. Try a different `--width`/`--height`.
 
 **Motors twitch but do not turn.** Raise **min speed** in settings.
+
+**The horn plays somewhere unexpected**, or not at all. `--list-devices` shows
+the playback devices; pass the right one with `--speaker-device`. A Pi with a
+monitor plugged in has an HDMI output that ALSA may prefer.
+
+**The Speak button is greyed out.** The page is not on HTTPS. Run
+`--make-cert` and use the `https://` address it prints.
+
+**Speak works on Android but not on the iPhone.** iOS is stricter about
+self-signed certificates than clicking through the warning covers. Open
+`/leonida-cert.pem` on the phone, install the profile, then turn it on under
+Settings → General → About → Certificate Trust Settings.
 
 **It runs but no motors move, and the log says mock mode.** `gpiozero` did not
 import — install `python3-gpiozero`. Mock mode is deliberate so the page and
