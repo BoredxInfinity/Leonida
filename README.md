@@ -49,6 +49,7 @@ It prints the URL to open. Useful flags:
 ```bash
 python3 leonida.py --list-devices          # what cameras and mics can it see?
 python3 leonida.py --check-camera          # grab one frame and inspect it
+python3 leonida.py --fetch-model           # download the depth model, once
 python3 leonida.py --width 1280 --height 720 --fps 15
 python3 leonida.py --video-device /dev/video2
 python3 leonida.py --audio-device plughw:2,0
@@ -148,6 +149,60 @@ roughly 15 frames a second on a LAN, off the same single capture.
 `/stream/video` is still served as ordinary MJPEG, so `vlc http://pi:8000/stream/video`
 and similar tools keep working. The page just no longer depends on it.
 
+## Depth overlay (optional)
+
+A monocular depth model can be laid over the camera feed — near things red, far
+things blue. Turn it on under Settings.
+
+**It runs in your browser, not on the car.** That is the whole design. The Pi
+holds the GPIO pins and cuts the motors after 0.6 s of silence, so spending its
+four cores on a neural network is a good way to make the car stutter to a halt
+mid-drive. The frames have already arrived in the browser to be displayed, so
+running the model there costs the car nothing at all, works out to one model per
+viewer, and can be changed without touching the vehicle.
+
+One-time setup on the Pi (about 70 MB, kept out of git):
+
+```bash
+python3 leonida.py --fetch-model
+```
+
+That downloads ONNX Runtime Web and Depth Anything V2 Small into `assets/`, and
+the Pi serves them itself — so the overlay still works parked somewhere with no
+internet, or with the Pi as its own hotspot.
+
+### It needs WebGPU
+
+Measured on a laptop, one 336×252 frame of this model costs:
+
+| | per frame | |
+|---|---|---|
+| WebGPU, fp16 | **25 ms** | 40 fps |
+| WebGPU, int8 | 1578 ms | WebGPU has no int8 kernels for these ops and quietly falls back to the CPU |
+| WASM, int8, 1 thread | 1243 ms | |
+
+So this is WebGPU or nothing, and the fp16 model is the one that ships. On a
+browser without WebGPU the overlay refuses to start and says so rather than
+pretending. End to end — JPEG decode, inference, colouring — expect somewhere
+around 15–30 fps on a recent phone or laptop, and nothing at all on an old one.
+
+Two things it will not do. The output is **relative** inverse depth, not metres:
+good for "that is nearer than that", useless for "that wall is 2.3 m away".
+And the model has no idea what your car is; it is a general-purpose depth
+estimator being pointed at a floor.
+
+### It gets out of the way
+
+Inference runs in a Web Worker, so it never blocks the page's main thread —
+which matters, because that thread also sends the keepalive that stops the car
+from cutting out. Frames are offered to the model only when it is idle; if it
+cannot keep up, frames are dropped rather than queued, so the picture stays live
+and only the overlay slows down.
+
+As a backstop the page times its own keepalive tick. If that starts arriving
+late while the overlay is on, the overlay switches itself off and says so.
+Driving comes first.
+
 ## Endpoints
 
 | Route | Purpose |
@@ -156,6 +211,7 @@ and similar tools keep working. The page just no longer depends on it.
 | `GET /ws` | WebSocket — the normal control path |
 | `GET /ws/video` | WebSocket — one whole JPEG per binary message; how the page watches |
 | `GET /snapshot.jpg` | a single JPEG; the page's fallback, and handy on its own |
+| `GET /assets/<file>` | the depth runtime and model, if fetched (cached hard) |
 | `GET /drive?m1=&m2=&m3=` | all three motors in one request (HTTP fallback) |
 | `GET /motor1?power=-100..100` | one motor; also POST with `{"power": -40}` |
 | `GET /ping` | refreshes the failsafe on the fallback path |

@@ -7,3 +7,6 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
+# Depth-overlay runtime and model, ~70MB, fetched with --fetch-model
+assets/

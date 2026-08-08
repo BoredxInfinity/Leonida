@@ -38,6 +38,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import select
 import signal
@@ -66,6 +67,40 @@ VIDEO_QUEUE = 4            # frames held per browser before it starts skipping
 AUDIO_QUEUE = 48           # chunks held per browser
 MAX_FRAME_BUFFER = 4 * 1024 * 1024
 BOUNDARY = "leonida"       # our multipart boundary
+
+# ---- depth overlay --------------------------------------------------------
+#
+# Optional, and entirely the browser's problem. The Pi does not do any of this:
+# it holds the GPIO pins and has a half-second deadman on the motors, so
+# spending its four cores on a neural network is a good way to make the car
+# stutter. Measured on a laptop, one frame of Depth Anything V2 Small costs
+# 25ms on WebGPU and 1250ms without it -- so the browser does the work, on a
+# thread of its own, and the car never notices either way.
+#
+# The files are large and are fetched once with --fetch-model rather than
+# living in git. They are served from the Pi, not a CDN, so the feature still
+# works parked in a field with no internet.
+
+ORT_VERSION = "1.27.0"
+_ORT = f"https://cdn.jsdelivr.net/npm/onnxruntime-web@{ORT_VERSION}/dist"
+_MODEL = ("https://huggingface.co/onnx-community/depth-anything-v2-small"
+          "/resolve/main/onnx")
+
+DEPTH_MODEL = "depth-fp16.onnx"
+ASSET_SOURCES = [
+    (f"{_ORT}/ort.webgpu.bundle.min.mjs", "ort.webgpu.bundle.min.mjs"),
+    (f"{_ORT}/ort-wasm-simd-threaded.asyncify.mjs",
+     "ort-wasm-simd-threaded.asyncify.mjs"),
+    (f"{_ORT}/ort-wasm-simd-threaded.asyncify.wasm",
+     "ort-wasm-simd-threaded.asyncify.wasm"),
+    # fp16, not one of the quantized builds: WebGPU has no int8 kernels for
+    # these ops and silently falls back to the CPU, which measured 60x slower.
+    (f"{_MODEL}/model_fp16.onnx", DEPTH_MODEL),
+]
+
+ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+ASSET_TYPES = {".mjs": "text/javascript", ".js": "text/javascript",
+               ".wasm": "application/wasm", ".onnx": "application/octet-stream"}
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_MAX_PAYLOAD = 64 * 1024
@@ -738,6 +773,53 @@ def detect_audio_device():
     return f"plughw:{m.group(1)},{m.group(2)}" if m else "default"
 
 
+def depth_ready():
+    """Are all the depth-overlay assets on disk?"""
+    return all(os.path.isfile(os.path.join(ASSET_DIR, name))
+               for _url, name in ASSET_SOURCES)
+
+
+def fetch_assets():
+    """Download the runtime and the model onto the Pi, once."""
+    import urllib.request
+
+    os.makedirs(ASSET_DIR, exist_ok=True)
+    print(f"\n  fetching depth-overlay assets into {ASSET_DIR}")
+    for url, name in ASSET_SOURCES:
+        target = os.path.join(ASSET_DIR, name)
+        if os.path.isfile(target):
+            print(f"    have  {name}")
+            continue
+        part = target + ".part"
+        print(f"    get   {name} ... ", end="", flush=True)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "leonida"})
+            with urllib.request.urlopen(req, timeout=60) as r, \
+                    open(part, "wb") as out:
+                total = int(r.headers.get("Content-Length") or 0)
+                done = 0
+                while True:
+                    chunk = r.read(262144)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        print(f"\r    get   {name} ... "
+                              f"{done * 100 // total}%", end="", flush=True)
+            os.replace(part, target)
+            print(f"\r    got   {name} ({done / 1e6:.1f} MB)      ")
+        except Exception as e:                    # network, disk, anything
+            if os.path.exists(part):
+                os.remove(part)
+            print(f"\n    FAILED: {e}")
+            print("\n  Nothing else was changed. Fix the problem and run it "
+                  "again;\n  files already downloaded are kept.\n")
+            return 1
+    print("\n  Done. Turn the overlay on under Settings in the page.\n")
+    return 0
+
+
 def describe_jpeg(frame):
     """What a decoder will make of this frame: its segments and its size."""
     names = {0xC0: "SOF0 baseline", 0xC1: "SOF1", 0xC2: "SOF2 progressive",
@@ -977,8 +1059,14 @@ PAGE = r"""<!doctype html>
     object-fit:cover; background:#000; z-index:0; display:block;
   }
   #feed.dead{opacity:0}
+  /* depth sits directly on the feed, under everything else */
+  #depth{
+    position:fixed; inset:0; width:100%; height:100%;
+    object-fit:cover; z-index:1; display:none; pointer-events:none;
+  }
+  #depth.on{display:block}
   #feedmsg{
-    position:fixed; inset:0; z-index:1; display:none;
+    position:fixed; inset:0; z-index:2; display:none;
     align-items:center; justify-content:center; flex-direction:column; gap:8px;
     color:var(--muted); font-size:14px; text-align:center; padding:24px;
   }
@@ -989,7 +1077,7 @@ PAGE = r"""<!doctype html>
   @keyframes spin{to{transform:rotate(360deg)}}
 
   /* ---- everything else floats on top of it ---- */
-  .hud{position:fixed;inset:0;z-index:2;pointer-events:none}
+  .hud{position:fixed;inset:0;z-index:3;pointer-events:none}
   .hud>*{pointer-events:auto}
 
   .top{
@@ -1085,6 +1173,7 @@ PAGE = r"""<!doctype html>
 <body>
 
 <img id="feed" alt="camera feed">
+<canvas id="depth"></canvas>
 <div id="feedmsg" class="show"><div class="spin"></div><span id="feedtext">connecting to camera&hellip;</span></div>
 <audio id="audio"></audio>
 
@@ -1119,6 +1208,18 @@ PAGE = r"""<!doctype html>
         <label class="chk"><input type="checkbox" id="camon" checked> Camera feed on</label>
         <label class="chk"><input type="checkbox" id="fit"> Fit whole frame (no crop)</label>
       </div>
+
+      <div class="grid2">
+        <label class="chk"><input type="checkbox" id="depthon"> Depth overlay</label>
+        <div>
+          <label>Depth opacity (%)</label>
+          <input id="depthop" type="number" min="10" max="100" value="55">
+        </div>
+      </div>
+      <p class="hint" id="depthnote" style="text-align:left;margin:6px 0 0">
+        Runs a depth model in this browser, not on the car &ndash; the Pi keeps
+        its cores for driving. Needs WebGPU to be usable.
+      </p>
 
       <div class="row" style="margin-top:14px">
         <div>
@@ -1179,6 +1280,107 @@ PAGE = r"""<!doctype html>
 
 </div>
 
+<!-- The depth worker. Kept as text and started from a blob so that the whole
+     program remains one file you can copy to a Pi and run. Everything in here
+     runs on its own thread: the page's main thread must stay free, because
+     that is where the joystick lives and where the keepalive that stops the
+     car from cutting out is sent. -->
+<script id="depthworker" type="text/plain">
+let ort = null, session = null, W = 0, H = 0, cv = null, cx = null, busy = false;
+const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
+
+// Depth Anything is a vision transformer with a patch size of 14, so both
+// sides of the input have to be a multiple of that. We fit the camera's own
+// aspect rather than squashing it into a square -- costs nothing measurable
+// and stops the depth being wrong at the edges.
+const SHORT = 252;
+function planSize(w, h){
+  const round14 = v => Math.max(14, Math.round(v / 14) * 14);
+  return h <= w ? [round14(w / h * SHORT), SHORT] : [SHORT, round14(h / w * SHORT)];
+}
+
+self.onmessage = async e => {
+  const m = e.data;
+  if (m.type === 'init') return init(m);
+  if (m.type === 'frame') return frame(m.buf);
+};
+
+async function init(m){
+  try {
+    if (!self.navigator || !navigator.gpu){
+      return post({type:'error', fatal:true,
+                   msg:'this browser has no WebGPU, so depth would run at about one frame a second'});
+    }
+    ort = await import(m.base + 'ort.webgpu.bundle.min.mjs');
+    ort.env.wasm.wasmPaths = m.base;
+    ort.env.wasm.numThreads = 1;
+    const t0 = performance.now();
+    session = await ort.InferenceSession.create(m.base + m.model,
+      { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' });
+    post({type:'ready', ms: Math.round(performance.now() - t0)});
+  } catch (err) {
+    post({type:'error', fatal:true, msg: String(err && err.message || err).slice(0, 160)});
+  }
+}
+
+async function frame(buf){
+  // Always answer, even when dropping the frame. The page will not offer
+  // another until it hears back, so going quiet here stops the overlay dead --
+  // which is exactly what happened while the model was still loading.
+  if (!session || busy) return post({type:'skip'});
+  busy = true;
+  const t0 = performance.now();
+  try {
+    const bmp = await createImageBitmap(new Blob([buf], {type:'image/jpeg'}));
+    if (!W){
+      [W, H] = planSize(bmp.width, bmp.height);
+      cv = new OffscreenCanvas(W, H);
+      cx = cv.getContext('2d', {willReadFrequently:true});
+    }
+    cx.drawImage(bmp, 0, 0, W, H);
+    bmp.close();
+
+    const px = cx.getImageData(0, 0, W, H).data;
+    const n = W * H, f = new Float32Array(3 * n);
+    for (let i = 0; i < n; i++){
+      f[i]         = (px[i*4]     / 255 - MEAN[0]) / STD[0];
+      f[i + n]     = (px[i*4 + 1] / 255 - MEAN[1]) / STD[1];
+      f[i + 2*n]   = (px[i*4 + 2] / 255 - MEAN[2]) / STD[2];
+    }
+    const feeds = {};
+    feeds[session.inputNames[0]] = new ort.Tensor('float32', f, [1, 3, H, W]);
+    const out = await session.run(feeds);
+    const r = out[session.outputNames[0]];
+    const d = r.data, dh = r.dims[r.dims.length - 2], dw = r.dims[r.dims.length - 1];
+
+    // The model gives relative inverse depth -- bigger means nearer, with no
+    // fixed scale -- so each frame is stretched over its own range.
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < d.length; i++){ const v = d[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    const span = (hi - lo) || 1;
+
+    const img = new ImageData(dw, dh);
+    for (let i = 0; i < dw * dh; i++){
+      const t = (d[i] - lo) / span;          // 0 far .. 1 near
+      img.data[i*4]     = 255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4*t - 3)));
+      img.data[i*4 + 1] = 255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4*t - 2)));
+      img.data[i*4 + 2] = 255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4*t - 1)));
+      img.data[i*4 + 3] = 255;
+    }
+    if (!cv.depthOut || cv.depthOut.width !== dw) cv.depthOut = new OffscreenCanvas(dw, dh);
+    cv.depthOut.getContext('2d').putImageData(img, 0, 0);
+    const bitmap = cv.depthOut.transferToImageBitmap();
+    post({type:'depth', bitmap, ms: Math.round(performance.now() - t0)}, [bitmap]);
+  } catch (err) {
+    post({type:'error', msg: String(err && err.message || err).slice(0, 160)});
+  } finally {
+    busy = false;
+  }
+}
+
+function post(m, transfer){ self.postMessage(m, transfer || []); }
+</script>
+
 <script>
 (() => {
   const $ = id => document.getElementById(id);
@@ -1197,8 +1399,8 @@ PAGE = r"""<!doctype html>
     inv3:     () => $('inv3').checked ? -1 : 1,
   };
 
-  const KEYS = ['minspd','maxspd','minsteer','maxsteer','deadzone'];
-  const BOOLS = ['inv1','inv2','inv3','camon','fit'];
+  const KEYS = ['minspd','maxspd','minsteer','maxsteer','deadzone','depthop'];
+  const BOOLS = ['inv1','inv2','inv3','camon','fit','depthon'];
   try {
     const s = JSON.parse(localStorage.getItem('leonida') || '{}');
     KEYS.forEach(k => { if (s[k] != null) $(k).value = s[k]; });
@@ -1269,10 +1471,35 @@ PAGE = r"""<!doctype html>
   // It runs well inside the failsafe window so that ordinary timer jitter, a
   // slow frame or a garbage collection pause, cannot stutter the motors: three
   // ticks in a row have to go missing before the car stops.
+  // This tick is also the canary. If anything ever makes the main thread miss
+  // its slot badly -- the depth overlay being the obvious candidate -- the
+  // keepalive goes with it and the car cuts out. So watch our own punctuality,
+  // and if it goes properly bad, drop the overlay rather than the throttle.
+  let lastTick = Date.now(), lagStrikes = 0;
   setInterval(() => {
+    const now = Date.now(), late = now - lastTick - 150;
+    lastTick = now;
+
     if (ws && ws.readyState === 1) ws.send('p');
     else viaHttp('/ping');
     if (Date.now() - okShown > 2000) dot.classList.remove('ok');
+
+    // Only judge our punctuality while the page is actually on screen. A
+    // backgrounded tab has its timers throttled to a crawl by the browser,
+    // which looks identical to a blocked main thread from in here -- and when
+    // the page is hidden the car is stopped anyway, so there is nothing to
+    // protect. Guessing wrong in that direction would switch the overlay off
+    // every time the phone was pocketed.
+    if (!depthWorker || document.hidden) { lagStrikes = 0; return; }
+    if (late > 400){
+      if (++lagStrikes >= 3){
+        $('depthon').checked = false; save(); depthStart();
+        depthSay('depth turned itself off: it was delaying the controls, and ' +
+                 'driving comes first');
+      }
+    } else if (late < 150) {
+      lagStrikes = 0;
+    }
   }, 150);
 
   connect();
@@ -1487,6 +1714,9 @@ PAGE = r"""<!doctype html>
         return;
       }
       showFrame(ev.data);
+      // showFrame copied the bytes into a Blob, so the buffer is still ours to
+      // hand over -- transferred, not copied, and dropped if the model is busy.
+      depthOffer(ev.data);
     };
     sock.onerror = () => { try { sock.close(); } catch {} };
     sock.onclose = () => {
@@ -1519,11 +1749,102 @@ PAGE = r"""<!doctype html>
     if (!camPolling || !$('camon').checked) return;
     feed.src = '/snapshot.jpg?t=' + Date.now();
   }
+  // ---- depth overlay -----------------------------------------------------
+  // The model runs in the worker above, in this browser, on frames that have
+  // already arrived for display. The car does no part of it and cannot be
+  // slowed down by it. All this thread does is hand over a buffer and draw the
+  // picture that comes back.
+  const depthCv = $('depth'), depthCx = depthCv.getContext('2d');
+  let depthWorker = null, depthInFlight = false, depthMs = 0;
+
+  function depthSay(text){ $('depthnote').textContent = text; }
+
+  function depthStop(){
+    if (depthWorker){ depthWorker.terminate(); depthWorker = null; }
+    depthInFlight = false;
+    depthCv.classList.remove('on');
+  }
+
+  function depthStart(){
+    depthStop();
+    if (!$('depthon').checked){
+      depthSay('Runs a depth model in this browser, not on the car — the Pi ' +
+               'keeps its cores for driving. Needs WebGPU to be usable.');
+      return;
+    }
+    if (!window.Worker || !window.OffscreenCanvas){
+      $('depthon').checked = false;
+      depthSay('This browser is missing the pieces needed to run the model.');
+      return;
+    }
+    depthSay('loading the depth model…');
+    const src = $('depthworker').textContent;
+    const url = URL.createObjectURL(new Blob([src], {type:'text/javascript'}));
+    try {
+      depthWorker = new Worker(url, {type:'module'});
+    } catch (e) {
+      $('depthon').checked = false;
+      depthSay('could not start the depth worker: ' + e.message);
+      return;
+    }
+    URL.revokeObjectURL(url);
+
+    depthWorker.onmessage = ev => {
+      const m = ev.data;
+      if (m.type === 'skip'){
+        depthInFlight = false;
+      } else if (m.type === 'ready'){
+        depthSay('depth model ready (' + m.ms + ' ms to load) — running here, ' +
+                 'not on the car');
+        depthCv.classList.add('on');
+      } else if (m.type === 'depth'){
+        depthInFlight = false;
+        depthMs = m.ms;
+        if (depthCv.width !== m.bitmap.width){
+          depthCv.width = m.bitmap.width; depthCv.height = m.bitmap.height;
+        }
+        depthCx.drawImage(m.bitmap, 0, 0);
+        m.bitmap.close();
+        depthSay('depth: ' + m.ms + ' ms per frame (' +
+                 (1000 / Math.max(1, m.ms)).toFixed(0) + ' fps) in this browser');
+      } else if (m.type === 'error'){
+        depthInFlight = false;
+        depthSay('depth off — ' + m.msg);
+        if (m.fatal){ $('depthon').checked = false; save(); depthStop(); }
+      }
+    };
+    depthWorker.onerror = e => {
+      depthSay('depth worker failed: ' + (e.message || 'unknown'));
+      $('depthon').checked = false; depthStop();
+    };
+    depthWorker.postMessage({type:'init', base: location.origin + '/assets/',
+                             model: 'DEPTH_MODEL_NAME'});
+  }
+
+  // Given a frame that has just arrived, offer it to the model. Never queues:
+  // if the worker is still busy this frame is simply skipped, so the overlay
+  // runs as fast as the device allows and no faster.
+  function depthOffer(buf){
+    if (!depthWorker || depthInFlight) return;
+    depthInFlight = true;
+    depthWorker.postMessage({type:'frame', buf}, [buf]);
+  }
+
+  function depthOpacity(){
+    depthCv.style.opacity = clamp(+$('depthop').value || 55, 10, 100) / 100;
+  }
+  $('depthop').addEventListener('input', depthOpacity);
+  depthOpacity();
+  $('depthon').addEventListener('change', depthStart);
+
   $('camon').addEventListener('change', () => { camTries = 0; camStart(); });
-  $('fit').addEventListener('change', () => {
-    feed.style.objectFit = $('fit').checked ? 'contain' : 'cover';
-  });
-  feed.style.objectFit = $('fit').checked ? 'contain' : 'cover';
+  function applyFit(){
+    const how = $('fit').checked ? 'contain' : 'cover';
+    feed.style.objectFit = how;
+    depthCv.style.objectFit = how;      // must crop exactly like the feed does
+  }
+  $('fit').addEventListener('change', applyFit);
+  applyFit();
 
   // ---- audio -------------------------------------------------------------
   // Muting tears the stream down rather than silencing it, so the mic is only
@@ -1569,16 +1890,21 @@ PAGE = r"""<!doctype html>
   // Let go of the car and its camera cleanly when the tab closes.
   addEventListener('pagehide', () => {
     stopAll();
-    camStop(); setMute(true);
+    camStop(); setMute(true); depthStop();
     if (ws){ const s = ws; ws = null; try { s.close(); } catch {} }
   });
 
   camStart();
+  depthStart();
 })();
 </script>
 </body>
 </html>
 """
+
+
+# The page names the model file; keep that in one place.
+PAGE = PAGE.replace("DEPTH_MODEL_NAME", DEPTH_MODEL)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1603,6 +1929,44 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status, payload):
         self._send(status, json.dumps(payload), "application/json")
 
+    def _send_asset(self, name):
+        """Serve one downloaded runtime or model file.
+
+        These are tens of megabytes and never change, so unlike everything
+        else here they are cached hard -- a phone that re-fetched the model on
+        every page load would be unusable.
+        """
+        # No directory traversal: a bare filename from our own manifest only.
+        if name != os.path.basename(name) or name.startswith("."):
+            self._json(404, {"error": "not found"})
+            return
+        if name not in [n for _u, n in ASSET_SOURCES]:
+            self._json(404, {"error": f"unknown asset: {name}"})
+            return
+
+        path = os.path.join(ASSET_DIR, name)
+        try:
+            size = os.path.getsize(path)
+            body = open(path, "rb")
+        except OSError:
+            self._json(503, {"error": "depth assets are not downloaded -- run "
+                                      "python3 leonida.py --fetch-model"})
+            return
+
+        ext = os.path.splitext(name)[1]
+        with body:
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             ASSET_TYPES.get(ext, "application/octet-stream"))
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            while True:
+                chunk = body.read(262144)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def _read_body(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1626,6 +1990,8 @@ class Handler(BaseHTTPRequestHandler):
             self._video_socket()
         elif path in ("/snapshot.jpg", "/snapshot"):
             self._snapshot()
+        elif path.startswith("/assets/"):
+            self._send_asset(path[len("/assets/"):])
         elif path == "/drive":
             self._drive(parsed.query)
         elif path == "/ping":
@@ -1713,6 +2079,7 @@ class Handler(BaseHTTPRequestHandler):
                         for name, stream in STREAMS.items()},
             "since_last_command": round(time.monotonic() - _last_command, 3),
             "deadman": DEADMAN,
+            "depth_assets": depth_ready(),
         })
 
     # ---- websocket ----
@@ -1998,11 +2365,16 @@ def main():
                     help="show the cameras and mics this machine can see, then exit")
     ap.add_argument("--check-camera", action="store_true",
                     help="grab one frame, report what is in it, then exit")
+    ap.add_argument("--fetch-model", action="store_true",
+                    help="download the depth-overlay runtime and model, then exit")
     CFG = ap.parse_args()
 
     if CFG.list_devices:
         list_devices()
         return
+
+    if CFG.fetch_model:
+        sys.exit(fetch_assets())
 
     if CFG.check_camera:
         sys.exit(check_camera())
@@ -2035,6 +2407,7 @@ def main():
     print(f"    camera     {CFG.video_device if not CFG.no_camera else 'off'}")
     print(f"    mic        {CFG.audio_device if not CFG.no_audio else 'off'}")
     print(f"    failsafe   motors stop after {DEADMAN:.1f}s of silence")
+    print(f"    depth      {'available (browser-side)' if depth_ready() else 'off -- run --fetch-model to enable'}")
     print("    Ctrl-C to quit")
     print()
 
