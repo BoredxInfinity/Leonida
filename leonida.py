@@ -501,10 +501,10 @@ def _kill(proc):
 
 # ---- the speaker ----------------------------------------------------------
 #
-# One ffmpeg writing to the headphone jack, fed by a thread that builds 20ms
+# One ffmpeg writing to the USB audio dongle, fed by a thread that builds 20ms
 # chunks out of whatever is making noise: the horn, speech arriving from a
 # phone, or both at once. Started when something wants to be heard and stopped
-# a couple of seconds after the car goes quiet, so the jack is not held open
+# a couple of seconds after the car goes quiet, so the device is not held open
 # all day but a second horn press is still instant.
 
 
@@ -1025,18 +1025,33 @@ def audio_argv():
 
 
 def detect_audio_device():
-    """First ALSA capture device, as plughw:<card>,<device>.
+    """The webcam's ALSA capture device, as plughw:<card>,<device>.
 
     A USB webcam lands on an unpredictable card number, and guessing wrong
-    costs an afternoon, so ask rather than hardcode.
+    costs an afternoon, so ask rather than hardcode. The speaker's USB dongle
+    also enumerates a capture side -- a mic input with nothing plugged into it
+    -- so prefer anything that names itself a camera over just taking the first
+    card, which is silence if the dongle happens to enumerate first.
     """
     try:
         out = subprocess.run(["arecord", "-l"], capture_output=True,
                              text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return "default"
-    m = re.search(r"^card (\d+):.*?device (\d+):", out, re.M)
-    return f"plughw:{m.group(1)},{m.group(2)}" if m else "default"
+    cards = re.findall(r"^card (\d+): (.*?device (\d+):.*)$", out, re.M)
+    if not cards:
+        return "default"
+
+    def rank(entry):
+        line = entry[1].lower()
+        if "cam" in line:                     # Camera, Webcam, USB Camera
+            return 0
+        if "usb audio" in line:               # the speaker dongle's mic input
+            return 2
+        return 1
+
+    num, _line, dev = min(cards, key=rank)
+    return f"plughw:{num},{dev}"
 
 
 def depth_ready():
@@ -1157,23 +1172,36 @@ def check_camera():
 
 
 def detect_speaker_device():
-    """First ALSA playback device, preferring the headphone jack.
+    """The ALSA playback device the speaker is plugged into.
 
-    A Pi with a monitor attached usually enumerates HDMI first, and sending the
-    horn to a monitor's speakers is a confusing way to find that out.
+    The speaker hangs off a USB-to-3.5mm dongle, so a USB audio card is what we
+    want; the Pi's own headphone jack and HDMI are both wrong now, and HDMI is
+    especially confusing because a Pi with a monitor attached enumerates it
+    first and the horn comes out of the monitor.
     """
     try:
         out = subprocess.run(["aplay", "-l"], capture_output=True,
                              text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return "default"
-    cards = re.findall(r"^card (\d+): (\S+).*?device (\d+):", out, re.M)
+    # The whole line, not just the short name: a dongle is usually
+    # "card 1: Device [USB Audio Device], device 0: USB Audio [USB Audio]",
+    # where the only word that identifies it is in the bracketed long name.
+    cards = re.findall(r"^card (\d+): (.*?device (\d+):.*)$", out, re.M)
     if not cards:
         return "default"
-    for num, name, dev in cards:
-        if "headphone" in name.lower() or "audiojack" in name.lower():
-            return f"plughw:{num},{dev}"
-    num, _name, dev = cards[0]
+
+    def rank(entry):
+        line = entry[1].lower()
+        if "usb" in line:                              # the dongle
+            return 0
+        if "headphone" in line or "audiojack" in line:  # the Pi's own jack
+            return 1
+        if "hdmi" in line or "vc4" in line:            # the monitor
+            return 3
+        return 2
+
+    num, _line, dev = min(cards, key=rank)
     return f"plughw:{num},{dev}"
 
 
@@ -3080,7 +3108,7 @@ def main():
                     help="download the depth-overlay runtime and model, then exit")
 
     ap.add_argument("--speaker-device", default="auto",
-                    help='ALSA playback device, or "auto" for the headphone jack')
+                    help='ALSA playback device, or "auto" for the USB audio dongle')
     ap.add_argument("--speaker-format", default="alsa",
                     help="ffmpeg output format (audiotoolbox on a Mac, "
                          "wav to write a file)")

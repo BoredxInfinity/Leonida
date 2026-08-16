@@ -23,7 +23,7 @@ Three motors on an H-bridge, wired to these BCM pins:
 | 3 | steering | GPIO 18 | GPIO 19 |
 
 Plus one USB webcam, which supplies both the video and the microphone, and a
-speaker in the headphone jack if you want the car to make noise.
+speaker on a USB-to-3.5mm audio dongle if you want the car to make noise.
 
 If a drive motor is wired backwards, tick its invert box in the page's settings
 rather than rewiring. If steering goes the wrong way, invert steering there too —
@@ -61,8 +61,9 @@ python3 leonida.py --no-audio              # camera only
 python3 leonida.py --port 8080
 ```
 
-The mic is found automatically (first ALSA capture card). Pass `--audio-device`
-if it guesses wrong; `--list-devices` shows the options.
+The mic is found automatically: the first ALSA capture card that names itself a
+camera, so the speaker dongle's own (unused) mic input does not win. Pass
+`--audio-device` if it guesses wrong; `--list-devices` shows the options.
 
 ## Start it on boot
 
@@ -173,9 +174,10 @@ or space, when the last controller disconnects, and — the one that matters —
 when the car stops hearing from the page for 0.6 s, the same deadman that stops
 the wheels. Drive out of range mid-blast and it goes quiet on its own.
 
-Set the output with `--speaker-device`; by default it finds the headphone jack
-in `aplay -l`, preferring it over HDMI, which is where a Pi with a monitor
-attached would otherwise send the horn. `--horn-tones 350,420` changes the note
+Set the output with `--speaker-device`; by default it finds the USB audio
+dongle in `aplay -l`, preferring it over the Pi's own headphone jack and over
+HDMI, which is where a Pi with a monitor attached would otherwise send the
+horn. `--horn-tones 350,420` changes the note
 (whole numbers of hertz, or the loop clicks) and `--no-speaker` keeps the car
 silent.
 
@@ -328,8 +330,9 @@ Two things it checks for specifically:
 **Motors twitch but do not turn.** Raise **min speed** in settings.
 
 **The horn plays somewhere unexpected**, or not at all. `--list-devices` shows
-the playback devices; pass the right one with `--speaker-device`. A Pi with a
-monitor plugged in has an HDMI output that ALSA may prefer.
+the playback devices; pass the right one with `--speaker-device`. Check the USB
+dongle is seated -- unplugged, the guess falls back to the Pi's own jack or, on
+a Pi with a monitor, HDMI.
 
 **The Speak button is greyed out.** The page is not on HTTPS. Run
 `--make-cert` and use the `https://` address it prints.
